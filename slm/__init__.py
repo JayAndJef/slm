@@ -7,12 +7,13 @@ Public API, organized by concern:
               (rust, the default), :class:`SimpleTokenizer` (from scratch, the fallback)
 - model     : :class:`JLM`
 - data      : :func:`load_docs`, :func:`build_corpus`, :func:`get_batch`
+- checkpoint: the compact ``{model, step, val, config}`` format — save/load
 - train     : :func:`train` (Lightning driver); :mod:`slm.lit` has LitJLM/SLMDataModule
 - generate  : :func:`generate`, :func:`load_model`
 
 See ``main.py`` at the repo root for the CLI entrypoint.
 """
-from slm import paths
+from slm import checkpoint, paths
 from slm.config import ModelConfig, TrainConfig, default_configs
 from slm.data import build_corpus, get_batch, load_docs
 from slm.generate import generate, load_model
@@ -21,7 +22,7 @@ from slm.tokenizer import HFTokenizer, SimpleTokenizer, Tokenizer, load_tokenize
 from slm.train import train
 
 __all__ = [
-    "paths",
+    "paths", "checkpoint",
     "ModelConfig", "TrainConfig", "default_configs",
     "Tokenizer", "load_tokenizer", "HFTokenizer", "SimpleTokenizer",
     "JLM",

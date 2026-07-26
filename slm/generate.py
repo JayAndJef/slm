@@ -7,6 +7,7 @@ embeddings only cover that many positions.
 import torch
 import torch.nn.functional as F
 
+from slm import checkpoint
 from slm.config import ModelConfig
 from slm.model import JLM
 
@@ -15,15 +16,12 @@ def load_model(checkpoint_path, device) -> tuple[JLM, ModelConfig, dict]:
     """Rebuild a :class:`JLM` from a checkpoint and load its weights (eval mode).
 
     Returns ``(model, model_cfg, meta)`` where ``meta`` carries ``step``/``val`` for
-    display. ``weights_only=False`` is safe here — these are our own trusted checkpoints
-    holding tensors plus a small plain-dict config.
+    display. The on-disk format lives in :mod:`slm.checkpoint`.
     """
-    ck = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg = ModelConfig.from_dict(ck["config"])
+    state, cfg, meta = checkpoint.load(checkpoint_path, map_location=device)
     model = JLM.from_config(cfg).to(device)
-    model.load_state_dict(ck["model"])
+    model.load_state_dict(state)
     model.eval()
-    meta = {"step": ck.get("step"), "val": ck.get("val")}
     return model, cfg, meta
 
 

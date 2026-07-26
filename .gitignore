@@ -13,7 +13,10 @@ wheels/
 # trained tokenizer; notebooks/tokenizer.json is still tracked (no *.json rule).
 # NOTE: a checkpoint is unusable without the tokenizer that produced its ids, so
 # data/tokenizer-32k.json has to be distributed alongside any published weights.
-data/
+# It must be `data/*` + a negation, not `data/`: git cannot re-include a file whose
+# parent directory is excluded, so `data/` would silently keep the tokenizer out.
+data/*
+!data/*.json
 *.npy
 checkpoints/
 *.pt

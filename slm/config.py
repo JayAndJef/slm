@@ -61,6 +61,7 @@ class TrainConfig:
     n_train_docs: int | None = None     # cap on training docs after mixing; None = all
     n_val_docs: int = 5_000
     seed: int = 42
+    sampler_seed: int | None = None     # window order only; None = follow `seed`
     sep: str = "\n<|endoftext|>\n"      # literal document separator (one token id in the corpus)
     n_workers: int = 16
     tokens_per_byte: float | None = None  # measured from the corpus at setup; drives val_bpb
@@ -81,6 +82,7 @@ class TrainConfig:
     eval_every: int = 1000               # -> Trainer val_check_interval (steps)
     eval_iters: int = 18                # -> Trainer limit_val_batches
     tag: str = "cosmo"                  # names the cached corpus files
+    init_from: Path | None = None       # compact checkpoint whose weights start this run
     out_dir: Path = field(default_factory=lambda: paths.CKPT_DIR)
     data_dir: Path = field(default_factory=lambda: paths.DATA_DIR)
     tokenizer_path: Path = field(default_factory=lambda: paths.TOKENIZER_PATH)
@@ -113,6 +115,18 @@ class TrainConfig:
         key = repr((sorted(self.dataset_mix.items()), self.seed, self.sep, self.dataset_name))
         return hashlib.sha256(
             Path(self.tokenizer_path).read_bytes() + key.encode()).hexdigest()[:8]
+
+    @property
+    def window_seed(self) -> int:
+        """Seed for the *window order only*, deliberately outside :attr:`corpus_hash`.
+
+        ``seed`` shuffles the document pool, so changing it changes which documents exist
+        and which are held out — hence its place in the hash, and hence a re-encode when it
+        moves. "Serve the same corpus in a different order" is a separate question, and a
+        continuation run needs exactly that: without it the second run replays the window
+        order the first one already trained on.
+        """
+        return self.seed if self.sampler_seed is None else self.sampler_seed
 
     @property
     def train_path(self) -> Path:

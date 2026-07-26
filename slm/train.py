@@ -9,6 +9,7 @@ import torch
 from lightning.pytorch.callbacks import LearningRateMonitor, RichProgressBar
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
+from slm import checkpoint
 from slm.config import ModelConfig, TrainConfig
 from slm.lit import CompactCheckpoint, LitJLM, SLMDataModule
 from slm.tokenizer import load_tokenizer
@@ -28,8 +29,28 @@ def _make_logger(cfg: TrainConfig):
     return CSVLogger(save_dir=str(cfg.out_dir), name="logs")
 
 
-def train(model_cfg: ModelConfig, train_cfg: TrainConfig):
-    """Fit a model with Lightning; returns the path to the compact best checkpoint."""
+def train(model_cfg: ModelConfig | None, train_cfg: TrainConfig):
+    """Fit a model with Lightning; returns the path to the compact best checkpoint.
+
+    With ``train_cfg.init_from`` set, the run starts from that checkpoint's **weights** —
+    not its optimizer moments, scheduler position or dataloader offset, none of which the
+    compact format stores. The LR schedule therefore starts from scratch, so a continuation
+    must be given one that makes sense from a trained model (a bare anneal, or a re-warm)
+    rather than the schedule that produced it.
+
+    The architecture then comes from the checkpoint and ``model_cfg`` is ignored — weights
+    can only be rebuilt at the dimensions they were trained at — so callers that continue a
+    run may pass ``None``.
+    """
+    init_state, best = None, float("inf")
+    if train_cfg.init_from is not None:
+        init_state, model_cfg, meta = checkpoint.load(train_cfg.init_from)
+        if meta["val"] is not None:
+            best = meta["val"]          # only improvements on the source model get saved
+        print(f"continuing from {train_cfg.init_from} "
+              f"(step {meta['step']}, val {meta['val']:.4f}) — weights only")
+    assert model_cfg is not None, "pass a ModelConfig, or set train_cfg.init_from"
+
     n_vocab = load_tokenizer(train_cfg.tokenizer_path).n_vocab
     assert model_cfg.vocab_size == n_vocab, (
         f"model vocab_size {model_cfg.vocab_size} != tokenizer {n_vocab} "
@@ -54,13 +75,14 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig):
         use_distributed_sampler=False,          # IterableDataset shards via per-rank seed
         log_every_n_steps=max(1, train_cfg.eval_every // 10),
         callbacks=[
-            CompactCheckpoint(train_cfg.out_dir, model_cfg),
+            CompactCheckpoint(train_cfg.out_dir, model_cfg, best=best),
             RichProgressBar(),
             LearningRateMonitor(logging_interval="step"),
         ],
         logger=_make_logger(train_cfg),
     )
-    lit = LitJLM(model_cfg, train_cfg)
+    lit = LitJLM(model_cfg, train_cfg, init_state=init_state)
+    del init_state
     dm = SLMDataModule(train_cfg, model_cfg)
     trainer.fit(lit, datamodule=dm)
     return train_cfg.out_dir / "best.pt"

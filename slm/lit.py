@@ -16,6 +16,7 @@ import lightning as L
 import numpy as np
 import torch
 
+from slm import checkpoint
 from slm.config import ModelConfig, TrainConfig
 from slm.data import build_corpus, load_docs
 from slm.dataset import build_dataloader
@@ -76,16 +77,23 @@ class MuonAdamW(torch.optim.Optimizer):
 
 
 class LitJLM(L.LightningModule):
-    """LightningModule wrapping JLM: (logits, loss) forward → train/val steps."""
+    """LightningModule wrapping JLM: (logits, loss) forward → train/val steps.
 
-    def __init__(self, model_cfg: ModelConfig, train_cfg: TrainConfig):
+    ``init_state`` seeds the weights from a previous run (see :mod:`slm.checkpoint`). It is
+    passed in already loaded rather than as a path, so this class stays free of filesystem
+    access and can be constructed in a test from a bare state dict.
+    """
+
+    def __init__(self, model_cfg: ModelConfig, train_cfg: TrainConfig,
+                 init_state: dict | None = None):
         super().__init__()
         self.model_cfg = model_cfg
         self.train_cfg = train_cfg
         self.save_hyperparameters(model_cfg.to_dict())
         self.model = JLM.from_config(model_cfg)
+        if init_state is not None:
+            self.model.load_state_dict(init_state)
         if train_cfg.compile:
-            # Compile the inner module; Lightning wraps the LightningModule in DDP outside it.
             self.model = torch.compile(self.model)
         self._t_prev = None
 
@@ -181,7 +189,7 @@ class SLMDataModule(L.LightningDataModule):
     def train_dataloader(self):
         return build_dataloader(
             self.train_path, block_size=self.model_cfg.block_size,
-            batch_size=self.cfg.batch_size, seed=self.cfg.seed,
+            batch_size=self.cfg.batch_size, seed=self.cfg.window_seed,
             rank=self.rank, world_size=self.world_size,
             num_workers=self.cfg.dataloader_workers, sep_id=self.sep_id)
 
@@ -194,17 +202,20 @@ class SLMDataModule(L.LightningDataModule):
 
 
 class CompactCheckpoint(L.Callback):
-    """Save the compact ``{model, step, val, config}`` checkpoint on improved val loss.
+    """Save the compact checkpoint (see :mod:`slm.checkpoint`) on improved val loss.
 
-    Writes the plain JLM state_dict (stripping any ``torch.compile`` ``_orig_mod.``
-    prefix) so :func:`slm.generate.load_model` loads it with ``strict=True``.
+    ``best`` seeds the best-so-far. It defaults to infinity — meaning the first validation
+    always writes — which is right for a run starting from scratch and wrong for one
+    continuing from trained weights: re-warming makes val temporarily *worse*, so an
+    unseeded continuation would overwrite a good checkpoint with a worse one at its first
+    eval. :func:`slm.train.train` seeds it from the checkpoint being continued.
     """
 
-    def __init__(self, out_dir, model_cfg: ModelConfig):
+    def __init__(self, out_dir, model_cfg: ModelConfig, best: float = float("inf")):
         super().__init__()
         self.out_dir = out_dir
         self.model_cfg = model_cfg
-        self.best = float("inf")
+        self.best = best
 
     def on_validation_end(self, trainer, pl_module):
         if trainer.sanity_checking:
@@ -218,8 +229,5 @@ class CompactCheckpoint(L.Callback):
         self.best = val                       # kept in sync on all ranks (val is all-reduced)
         if not trainer.is_global_zero:
             return
-        core = getattr(pl_module.model, "_orig_mod", pl_module.model)
-        state = {k: v.detach().cpu() for k, v in core.state_dict().items()}
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        torch.save({"model": state, "step": trainer.global_step, "val": val,
-                    "config": self.model_cfg.to_dict()}, self.out_dir / "best.pt")
+        checkpoint.save(self.out_dir / "best.pt", pl_module.model,
+                        step=trainer.global_step, val=val, model_cfg=self.model_cfg)

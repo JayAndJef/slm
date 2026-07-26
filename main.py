@@ -1,6 +1,7 @@
 """Command-line entrypoint for the slm package.
 
     uv run main.py train [--smoke] [--hidden-dim N ...]
+    uv run main.py continue-train --init-from PATH --out-dir PATH
     uv run main.py generate [--checkpoint PATH] [--prompt STR]
     uv run main.py train-tokenizer --out PATH
 
@@ -19,6 +20,60 @@ from slm.generate import load_model
 from slm.tokenizer import HFTokenizer, SimpleTokenizer, load_tokenizer
 from slm.train import train as run_train
 
+# Flags shared by every command that runs a training loop. Declared once and applied by
+# `training_options` so `train` and `continue-train` cannot drift apart — the two differ in
+# what they *default* to, not in what they accept.
+#
+# Every default is None, meaning "not passed". That matters: a flag defaulting to its own
+# value would silently clobber --smoke's sizing, or a continuation's anneal schedule.
+_TRAINING_OPTIONS = [
+    click.option("--devices", default=None,
+                 help="GPU count, or comma-list of PyTorch indices (e.g. 2,3,4,5)."),
+    click.option("--accelerator", default=None, help='"auto" | "cuda" | "cpu".'),
+    click.option("--num-nodes", type=int, default=None),
+    click.option("--precision", default=None, help='e.g. "bf16-mixed", "32-true".'),
+    click.option("--dataloader-workers", type=int, default=None),
+    click.option("--wandb", is_flag=True, default=None, help="Log to Weights & Biases."),
+    click.option("--wandb-project", default=None),
+    click.option("--batch-size", type=int, default=None),
+    click.option("--max-steps", type=int, default=None),
+    click.option("--lr", type=float, default=None, help="Peak learning rate."),
+    click.option("--min-lr", type=float, default=None, help="Floor the decay anneals to."),
+    click.option("--warmup-steps", type=int, default=None),
+    click.option("--decay-frac", type=float, default=None,
+                 help="Trailing fraction of max_steps spent decaying (1.0 = pure anneal)."),
+    click.option("--sampler-seed", type=int, default=None,
+                 help="Reshuffles the window order without renaming the corpus cache."),
+    click.option("--eval-every", type=int, default=None, help="Steps between validations."),
+    click.option("--eval-iters", type=int, default=None,
+                 help="Val batches per rank (18 is one clean pass at batch 48 x 4 ranks)."),
+    click.option("--compile/--no-compile", "compile_", default=None,
+                 help="torch.compile the model (default on for real runs)."),
+    click.option("--doc-mask/--no-doc-mask", "doc_mask", default=None,
+                 help="Stop attention crossing document boundaries (default on)."),
+    click.option("--tokenizer", "tokenizer_path", type=click.Path(exists=True), default=None),
+]
+
+# click param name -> TrainConfig field, where they cannot match (`compile` is a builtin).
+_FIELD_ALIASES = {"compile_": "compile"}
+_PATH_FIELDS = {"out_dir", "tokenizer_path", "init_from"}
+
+
+def training_options(f):
+    """Attach the shared training flags. Reversed so --help lists them as declared."""
+    for option in reversed(_TRAINING_OPTIONS):
+        f = option(f)
+    return f
+
+
+def _apply(cfg: TrainConfig, **opts) -> None:
+    """Set every explicitly-passed option on ``cfg``; ``None`` means 'not passed'."""
+    for name, value in opts.items():
+        if value is None:
+            continue
+        name = _FIELD_ALIASES.get(name, name)
+        setattr(cfg, name, Path(value) if name in _PATH_FIELDS else value)
+
 
 @click.group()
 def cli():
@@ -27,56 +82,52 @@ def cli():
 
 @cli.command()
 @click.option("--smoke", is_flag=True, help="Tiny fast end-to-end sanity run.")
-@click.option("--devices", default=None, help="GPU count or comma-list of PyTorch indices")
-@click.option("--accelerator", default=None, help='"auto" | "cuda" | "cpu".')
-@click.option("--num-nodes", type=int, default=None)
-@click.option("--precision", default=None, help='e.g. "bf16-mixed", "32-true".')
-@click.option("--dataloader-workers", type=int, default=None)
-@click.option("--wandb", is_flag=True, help="Log to Weights & Biases.")
-@click.option("--wandb-project", default=None)
-@click.option("--max-steps", type=int, default=None)
-@click.option("--batch-size", type=int, default=None)
-@click.option("--lr", type=float, default=None)
-@click.option("--compile/--no-compile", "compile_", default=None,
-              help="torch.compile the model (default on for real runs).")
-@click.option("--doc-mask/--no-doc-mask", "doc_mask", default=None,
-              help="Stop attention crossing document boundaries (default on).")
 @click.option("--out-dir", type=click.Path(), default=None, help="Checkpoint output dir.")
-@click.option("--tokenizer", "tokenizer_path", type=click.Path(exists=True), default=None)
-# ModelConfig overrides (default None -> only applied when explicitly passed, so
-# --smoke sizing is never silently clobbered by a flag's own default).
+@training_options
+# ModelConfig overrides, likewise None-defaulted.
 @click.option("--vocab-size", type=int, default=None)
 @click.option("--hidden-dim", type=int, default=None)
 @click.option("--num-heads", type=int, default=None)
 @click.option("--n-layer", type=int, default=None)
 @click.option("--block-size", type=int, default=None)
-def train(smoke, devices, accelerator, num_nodes, precision, dataloader_workers, wandb,
-          wandb_project, max_steps, batch_size, lr, compile_, doc_mask, out_dir,
-          tokenizer_path, vocab_size, hidden_dim, num_heads, n_layer, block_size):
-    """Train a model with Lightning (real run, or a tiny --smoke run)."""
+def train(smoke, out_dir, vocab_size, hidden_dim, num_heads, n_layer, block_size, **opts):
+    """Train a model from scratch with Lightning (or a tiny --smoke run)."""
     model_cfg, train_cfg = default_configs(smoke=smoke)
-
-    for name, val in [("vocab_size", vocab_size), ("hidden_dim", hidden_dim),
-                      ("num_heads", num_heads), ("n_layer", n_layer),
-                      ("block_size", block_size)]:
-        if val is not None:
-            setattr(model_cfg, name, val)
-    for name, val in [("devices", devices), ("accelerator", accelerator),
-                      ("num_nodes", num_nodes), ("precision", precision),
-                      ("dataloader_workers", dataloader_workers),
-                      ("wandb_project", wandb_project),
-                      ("max_steps", max_steps), ("batch_size", batch_size),
-                      ("lr", lr), ("compile", compile_), ("doc_mask", doc_mask)]:
-        if val is not None:
-            setattr(train_cfg, name, val)
-    if wandb:                       # is_flag: only turn on when passed
-        train_cfg.wandb = True
-    if out_dir is not None:
-        train_cfg.out_dir = Path(out_dir)
-    if tokenizer_path is not None:
-        train_cfg.tokenizer_path = Path(tokenizer_path)
-
+    for name, value in [("vocab_size", vocab_size), ("hidden_dim", hidden_dim),
+                        ("num_heads", num_heads), ("n_layer", n_layer),
+                        ("block_size", block_size)]:
+        if value is not None:
+            setattr(model_cfg, name, value)
+    _apply(train_cfg, out_dir=out_dir, **opts)
     run_train(model_cfg, train_cfg)
+
+
+@cli.command("continue-train")
+@click.option("--init-from", type=click.Path(exists=True), required=True,
+              help="Compact checkpoint whose weights start this run.")
+@click.option("--out-dir", type=click.Path(), required=True,
+              help="Checkpoint output dir. Required, and should differ from --init-from's: "
+                   "the source model is the thing this run is trying to beat.")
+@training_options
+def continue_train(init_from, out_dir, **opts):
+    """Continue training from a checkpoint's weights under a fresh LR schedule.
+
+    Weights only — the compact format carries no optimizer moments, scheduler position or
+    dataloader offset, so momentum rebuilds over the first few hundred steps. The
+    architecture is read from the checkpoint; model-dimension flags would be meaningless
+    here and are deliberately absent.
+
+    Defaults describe a **pure anneal**: no warmup, no stable phase, decay straight from
+    ``--lr`` to ``--min-lr`` across ``--max-steps``. That is what a fully-decayed model
+    wants. To instead extend training, re-warm by passing a higher --lr with --warmup-steps
+    and a --decay-frac below 1.0, and expect val to regress before it improves.
+    """
+    _, train_cfg = default_configs()
+    train_cfg.init_from, train_cfg.out_dir = Path(init_from), Path(out_dir)
+    train_cfg.max_steps, train_cfg.warmup_steps = 4_000, 0
+    train_cfg.lr, train_cfg.min_lr, train_cfg.decay_frac = 1e-4, 0.0, 1.0
+    _apply(train_cfg, **opts)
+    run_train(None, train_cfg)          # architecture comes from the checkpoint
 
 
 @cli.command("prepare-data")
