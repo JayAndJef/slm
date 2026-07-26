@@ -24,11 +24,24 @@ from slm.tokenizer import load_tokenizer
 
 
 def lr_at(step: int, cfg: TrainConfig) -> float:
-    """Linear warmup for ``warmup_steps``, then cosine decay to ``min_lr``."""
+    """Trapezoidal (warmup-stable-decay) schedule: ramp up, hold, then decay to ``min_lr``.
+
+    Preferred over cosine because the peak is held constant rather than decaying from step
+    one, so the run length is not baked into the schedule: stop anywhere in the stable
+    phase, run the decay, and you have a finished model. Cosine has to know ``max_steps``
+    up front, and truncating it leaves the LR stranded mid-decay.
+
+    The decay uses ``1 - sqrt(progress)``, which holds the peak longer than a linear ramp
+    and empirically edges it out; the last ``decay_frac`` of the run is spent on it.
+    """
     if step < cfg.warmup_steps:
         return cfg.lr * (step + 1) / cfg.warmup_steps
-    prog = (step - cfg.warmup_steps) / max(1, cfg.max_steps - cfg.warmup_steps)
-    return cfg.min_lr + 0.5 * (cfg.lr - cfg.min_lr) * (1 + math.cos(math.pi * prog))
+    decay_steps = max(1, int(cfg.max_steps * cfg.decay_frac))
+    stable_end = cfg.max_steps - decay_steps
+    if step < stable_end:
+        return cfg.lr
+    prog = min(1.0, (step - stable_end) / decay_steps)
+    return cfg.min_lr + (cfg.lr - cfg.min_lr) * (1 - math.sqrt(prog))
 
 
 class MuonAdamW(torch.optim.Optimizer):

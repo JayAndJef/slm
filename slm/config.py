@@ -71,6 +71,7 @@ class TrainConfig:
     warmup_steps: int = 500
     lr: float = 6e-4
     min_lr: float = 6e-5
+    decay_frac: float = 0.2             # trailing fraction of max_steps spent decaying
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     compile: bool = True                # torch.compile the model (CUDA only)
