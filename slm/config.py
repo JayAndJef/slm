@@ -47,9 +47,17 @@ class TrainConfig:
     """Settings for one training run: data source, optimization, eval, runtime."""
 
     # data
-    dataset_name: str = "HuggingFaceFW/fineweb-edu"
-    dataset_config: str = "sample-10BT"
-    n_train_docs: int = 1_000_000
+    dataset_name: str = "HuggingFaceTB/cosmopedia"
+    dataset_mix: dict[str, int | None] = field(default_factory=lambda: {
+        "auto_math_text": None,         # 1.95M rows
+        "stanford": None,               # 1.02M
+        "stories": 1_000_000,           # of 4.99M
+        "web_samples_v2": 1_000_000,    # of 10.3M
+        "wikihow": None,                # 179k
+        "openstax": None,               # 126k
+        "khanacademy": None,            # 24k
+    })
+    n_train_docs: int | None = None     # cap on training docs after mixing; None = all
     n_val_docs: int = 5_000
     seed: int = 42
     sep: str = "\n<|endoftext|>\n"      # literal document separator (BPE learned it as one token)
@@ -69,7 +77,7 @@ class TrainConfig:
     # eval / checkpoint
     eval_every: int = 500               # -> Trainer val_check_interval (steps)
     eval_iters: int = 50                # -> Trainer limit_val_batches
-    tag: str = "full"                   # names the cached corpus files
+    tag: str = "cosmo"                  # names the cached corpus files
     out_dir: Path = field(default_factory=lambda: paths.CKPT_DIR)
     data_dir: Path = field(default_factory=lambda: paths.DATA_DIR)
     tokenizer_path: Path = field(default_factory=lambda: paths.TOKENIZER_PATH)
@@ -84,6 +92,16 @@ class TrainConfig:
     wandb: bool = False
     wandb_project: str = "slm"
 
+    @property
+    def train_path(self) -> Path:
+        """Cached train corpus. Named by ``tag`` + the doc cap, so changing the cap makes
+        a new file rather than silently reusing the old one."""
+        return self.data_dir / f"train_{self.tag}_{self.n_train_docs or 'all'}.npy"
+
+    @property
+    def val_path(self) -> Path:
+        return self.data_dir / f"val_{self.tag}_{self.n_val_docs}.npy"
+
 
 def default_configs(smoke: bool = False) -> tuple[ModelConfig, TrainConfig]:
     """Return the (model, train) config pair for a real run, or a tiny smoke run.
@@ -97,6 +115,9 @@ def default_configs(smoke: bool = False) -> tuple[ModelConfig, TrainConfig]:
 
     model = ModelConfig(hidden_dim=128, num_heads=4, n_layer=4, block_size=128)
     train = TrainConfig(
+        # One tiny config (24k rows, 46 MB) — a capped load still downloads whole HF
+        # configs, so smoke must narrow the mix, not just the doc count.
+        dataset_mix={"khanacademy": None},
         n_train_docs=2_000, n_val_docs=200,
         batch_size=16, max_steps=60, warmup_steps=10,
         eval_every=20, eval_iters=10,

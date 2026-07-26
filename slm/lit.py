@@ -136,9 +136,8 @@ class SLMDataModule(L.LightningDataModule):
         super().__init__()
         self.cfg = train_cfg
         self.model_cfg = model_cfg
-        dd = train_cfg.data_dir
-        self.train_path = dd / f"train_{train_cfg.tag}_{train_cfg.n_train_docs}.npy"
-        self.val_path = dd / f"val_{train_cfg.tag}_{train_cfg.n_val_docs}.npy"
+        self.train_path = train_cfg.train_path
+        self.val_path = train_cfg.val_path
 
     def prepare_data(self):
         # Lightning runs this on local-rank-0 only, before setup/DDP fan-out. Files only.

@@ -89,11 +89,10 @@ def prepare_data(smoke):
 
     _, cfg = default_configs(smoke=smoke)
     train_docs, val_docs = load_docs(cfg)
-    dd = cfg.data_dir
-    build_corpus(train_docs, dd / f"train_{cfg.tag}_{cfg.n_train_docs}.npy",
-                 cfg.tokenizer_path, sep=cfg.sep, n_workers=cfg.n_workers, logger=click.echo)
-    build_corpus(val_docs, dd / f"val_{cfg.tag}_{cfg.n_val_docs}.npy",
-                 cfg.tokenizer_path, sep=cfg.sep, n_workers=cfg.n_workers, logger=click.echo)
+    build_corpus(train_docs, cfg.train_path, cfg.tokenizer_path,
+                 sep=cfg.sep, n_workers=cfg.n_workers, logger=click.echo)
+    build_corpus(val_docs, cfg.val_path, cfg.tokenizer_path,
+                 sep=cfg.sep, n_workers=cfg.n_workers, logger=click.echo)
 
 
 @cli.command()
