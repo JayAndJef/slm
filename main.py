@@ -27,10 +27,7 @@ def cli():
 
 @cli.command()
 @click.option("--smoke", is_flag=True, help="Tiny fast end-to-end sanity run.")
-@click.option("--devices", default=None,
-              help="GPU count or comma-list of PyTorch indices. NOTE: PyTorch orders "
-                   "devices FASTEST_FIRST, so 0,1 are the Blackwells and 2-7 the A6000s "
-                   "(not nvidia-smi order).")
+@click.option("--devices", default=None, help="GPU count or comma-list of PyTorch indices")
 @click.option("--accelerator", default=None, help='"auto" | "cuda" | "cpu".')
 @click.option("--num-nodes", type=int, default=None)
 @click.option("--precision", default=None, help='e.g. "bf16-mixed", "32-true".')
