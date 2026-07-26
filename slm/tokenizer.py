@@ -10,7 +10,7 @@ Two interchangeable backends behind the :class:`Tokenizer` protocol:
 :func:`load_tokenizer` picks the backend by looking at the file, since the two on-disk
 formats are disjoint. Nothing else in the codebase needs to know which is in use.
 
-Both are **torch-free** — only the standard library plus (lazily) ``tokenizers`` — so
+Both are **torch-free** — only the standard library plus ``tokenizers`` — so
 corpus-encoding workers stay lightweight and never pull a CUDA context into a child.
 
 Design:
@@ -30,6 +30,11 @@ import re
 from collections import Counter
 from pathlib import Path
 from typing import Iterable, Protocol, runtime_checkable
+
+# Aliased: this module defines its own `Tokenizer` protocol, and the rust class would
+# otherwise shadow it.
+from tokenizers import Tokenizer as _RustTokenizer
+from tokenizers import decoders, models, pre_tokenizers, trainers
 
 # Split into "leading whitespace + word" chunks (or a pure-whitespace run). Merges never
 # cross chunk boundaries — this is what GPT-2's regex pre-split buys, and it keeps a
@@ -219,8 +224,7 @@ class HFTokenizer:
     """Byte-level BPE backed by HuggingFace ``tokenizers`` (rust).
 
     Same algorithm as :class:`SimpleTokenizer`, orders of magnitude faster to train and to
-    encode. ``tokenizers`` is imported lazily inside the constructors so the from-scratch
-    fallback still works on a machine without the package.
+    encode.
 
     The separator is a **declared special token**, not a merge BPE has to discover — the
     single-id property that document masking depends on is guaranteed by construction.
@@ -233,10 +237,7 @@ class HFTokenizer:
     @classmethod
     def train(cls, texts: Iterable[str], vocab_size: int, special: str) -> "HFTokenizer":
         """Train from an iterable of documents (never materialized as one string)."""
-        from tokenizers import Tokenizer as _Tk
-        from tokenizers import decoders, models, pre_tokenizers, trainers
-
-        tk = _Tk(models.BPE(unk_token=None))                      # byte-level: no UNK case
+        tk = _RustTokenizer(models.BPE(unk_token=None))                      # byte-level: no UNK case
         # add_prefix_space=False: True would prepend a space to *every* encode() call, so
         # generation's per-prompt encode would disagree with the corpus's per-chunk encode.
         tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True)
@@ -288,9 +289,7 @@ class HFTokenizer:
 
     @classmethod
     def load(cls, path) -> "HFTokenizer":
-        from tokenizers import Tokenizer as _Tk
-
         # Each corpus worker holds its own tokenizer; rust would otherwise spin up a rayon
         # pool per process on top of the 8 already-forked workers.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-        return cls(_Tk.from_file(str(path)))
+        return cls(_RustTokenizer.from_file(str(path)))

@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from datasets import concatenate_datasets, load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset
 
 from slm.config import TrainConfig
 from slm.tokenizer import Tokenizer, load_tokenizer
@@ -35,25 +35,28 @@ def _worker_init(tokenizer_path, sep: str) -> None:
     _WORKER_SEP = sep
 
 
-def _worker_encode(docs: list[str], chunk: int = 2_000) -> np.ndarray:
-    """Encode a slice of documents to a ``uint16`` array.
+def _worker_encode(shard, batch_size: int = 2_000) -> np.ndarray:
+    """Encode one shard of the document dataset to a ``uint16`` array.
 
-    Every document is prefixed with the separator, so concatenating slices keeps a
+    Takes an Arrow ``Dataset``, not a list of strings. A ``Dataset`` pickles by *file
+    path*, so what crosses the process boundary is a few hundred bytes of metadata and the
+    worker re-memory-maps the same file — rather than tens of GB of text being serialized,
+    copied through a pipe, and rebuilt as Python objects in every worker.
+
+    Every document is prefixed with the separator, so concatenating shards keeps a
     boundary token before each doc.
 
-    Encodes in chunks and narrows to ``uint16`` as it goes, rather than building one
-    Python ``list[int]`` for the whole slice. A CPython int costs ~36 bytes with its list
-    slot against 2 bytes here — at billions of tokens that is the difference between
-    ~14 GiB and more RAM than the machine has. It also keeps the value returned across
-    the process boundary small, since the list would otherwise be pickled whole.
+    Narrows to ``uint16`` per batch instead of accumulating one Python ``list[int]``: a
+    CPython int costs ~36 bytes with its list slot against 2 bytes here, which at billions
+    of tokens is the difference between ~14 GiB and more memory than the machine has.
     """
-    parts = [np.array(_WORKER_TOK.encode("".join(_WORKER_SEP + d for d in docs[i:i + chunk])),
+    parts = [np.array(_WORKER_TOK.encode("".join(_WORKER_SEP + d for d in batch["text"])),
                       dtype=np.uint16)
-             for i in range(0, len(docs), chunk)]
+             for batch in shard.iter(batch_size=batch_size)]
     return np.concatenate(parts) if parts else np.empty(0, dtype=np.uint16)
 
 
-def load_docs(cfg: TrainConfig) -> tuple[list[str], list[str]]:
+def load_docs(cfg: TrainConfig) -> tuple[Dataset, Dataset]:
     """Return (train_docs, val_docs) as disjoint random samples of ``cfg.dataset_mix``.
 
     Each HF config named in the mix is shuffled and trimmed to its row cap, the trimmed
@@ -79,20 +82,19 @@ def load_docs(cfg: TrainConfig) -> tuple[list[str], list[str]]:
         parts.append(ds)
     pool = concatenate_datasets(parts).shuffle(seed=cfg.seed)
 
-    val_docs = pool.select(range(min(cfg.n_val_docs, len(pool))))["text"]
+    n_val = min(cfg.n_val_docs, len(pool))
     end = len(pool) if cfg.n_train_docs is None else min(
         len(pool), cfg.n_val_docs + cfg.n_train_docs)
-    train_docs = pool.select(range(len(val_docs), end))["text"]
-    return train_docs, val_docs
+    return pool.select(range(n_val, end)), pool.select(range(n_val))
 
 
-def build_corpus(docs: list[str], cache_path, tokenizer_path, *, sep: str,
+def build_corpus(docs, cache_path, tokenizer_path, *, sep: str,
                  n_workers: int = 8, logger=None) -> np.ndarray:
-    """Encode ``docs`` to a cached ``uint16`` memmap, returning it.
+    """Encode a document ``Dataset`` to a cached ``uint16`` memmap, returning it.
 
     If ``cache_path`` exists it is memory-mapped and returned as-is. Otherwise the docs
-    are encoded across ``n_workers`` processes (round-robin slices), concatenated, saved,
-    and reopened read-only.
+    are sharded across ``n_workers`` processes, concatenated, saved, and reopened
+    read-only.
     """
     cache_path = Path(cache_path)
     if cache_path.exists():
@@ -110,13 +112,15 @@ def build_corpus(docs: list[str], cache_path, tokenizer_path, *, sep: str,
 
     if logger:
         logger(f"encoding {len(docs)} docs -> {cache_path.name} with {n_workers} workers")
-    slices = [docs[i::n_workers] for i in range(n_workers)]
+    # contiguous=False keeps the round-robin striding the old list slicing used, so worker
+    # order still reconstructs the pool's (already shuffled) document order.
+    shards = [docs.shard(n_workers, i, contiguous=False) for i in range(n_workers)]
     # forkserver (not fork) so encoding is safe even if a CUDA/NCCL context already
     # exists in this process (e.g. under DDP). Workers are torch-free regardless.
     ctx = mp.get_context("forkserver")
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx,
                              initializer=_worker_init, initargs=(tokenizer_path, sep)) as ex:
-        parts = list(ex.map(_worker_encode, slices))   # uint16 arrays, one per worker
+        parts = list(ex.map(_worker_encode, shards))   # uint16 arrays, one per worker
 
     arr = np.concatenate(parts)
     del parts                                          # free before np.save doubles nothing

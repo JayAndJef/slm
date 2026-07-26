@@ -136,15 +136,15 @@ def generate(checkpoint, prompt, max_new_tokens, temperature, top_p, num_samples
 def train_tokenizer(out_path, vocab_size, n_docs, backend):
     """Train a new BPE tokenizer on a random sample of the corpus."""
     cfg = TrainConfig(n_train_docs=n_docs, n_val_docs=0)
-    train_docs, _ = load_docs(cfg)
-    mb = sum(len(d.encode()) for d in train_docs) / 1e6
-    click.echo(f"training {backend} tokenizer (vocab {vocab_size}) on {len(train_docs)} "
-               f"docs ({mb:.1f} MB) ...")
+    train_docs, _ = load_docs(cfg)          # a Dataset; rows are dicts with a "text" key
+    click.echo(f"training {backend} tokenizer (vocab {vocab_size}) on "
+               f"{len(train_docs)} docs ...")
     if backend == "hf":
-        tok = HFTokenizer.train(train_docs, vocab_size=vocab_size, special=cfg.sep.strip())
+        tok = HFTokenizer.train((d["text"] for d in train_docs),
+                                vocab_size=vocab_size, special=cfg.sep.strip())
     else:
         tok = SimpleTokenizer(vocab_size=vocab_size)
-        tok.train_tokenizer(cfg.sep.join(train_docs))
+        tok.train_tokenizer(cfg.sep.join(train_docs["text"]))
     tok.save(out_path)
     click.echo(f"saved -> {out_path} ({tok.n_vocab} tokens, "
                f"sep_id {tok.sep_id(cfg.sep)})")

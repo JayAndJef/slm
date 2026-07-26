@@ -62,7 +62,7 @@ class TrainConfig:
     n_val_docs: int = 5_000
     seed: int = 42
     sep: str = "\n<|endoftext|>\n"      # literal document separator (one token id in the corpus)
-    n_workers: int = 8
+    n_workers: int = 16
     tokens_per_byte: float | None = None  # measured from the corpus at setup; drives val_bpb
 
     # optimization
