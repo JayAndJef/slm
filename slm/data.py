@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from datasets import concatenate_datasets, load_dataset
 
 from slm.config import TrainConfig
 from slm.tokenizer import SimpleTokenizer
@@ -66,8 +67,6 @@ def load_docs(cfg: TrainConfig) -> tuple[list[str], list[str]]:
     does change the pool, and therefore the val set — so losses are only comparable across
     runs that share a mix.
     """
-    from datasets import concatenate_datasets, load_dataset
-
     os.environ["HF_HOME"] = cfg.hf_cache_dir
     parts = []
     for name, cap in cfg.dataset_mix.items():

@@ -5,7 +5,9 @@ logger and callbacks, parses the device spec, and calls ``trainer.fit``. Multi-G
 data-parallel (DDP): pass ``devices`` as a count or a comma-list of PyTorch device indices.
 """
 import lightning as L
+import torch
 from lightning.pytorch.callbacks import LearningRateMonitor, RichProgressBar
+from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 from slm.config import ModelConfig, TrainConfig
 from slm.lit import CompactCheckpoint, LitJLM, SLMDataModule
@@ -21,15 +23,12 @@ def _parse_devices(spec: str):
 
 def _make_logger(cfg: TrainConfig):
     if cfg.wandb:
-        from lightning.pytorch.loggers import WandbLogger  # lazy: only when --wandb
         return WandbLogger(project=cfg.wandb_project)
-    from lightning.pytorch.loggers import CSVLogger
     return CSVLogger(save_dir=str(cfg.out_dir), name="logs")
 
 
 def train(model_cfg: ModelConfig, train_cfg: TrainConfig):
     """Fit a model with Lightning; returns the path to the compact best checkpoint."""
-    import torch
     torch.set_float32_matmul_precision("high")   # use Tensor Cores for fp32 matmuls
     devices = _parse_devices(train_cfg.devices)
     n_devices = len(devices) if isinstance(devices, list) else devices

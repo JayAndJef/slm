@@ -6,13 +6,18 @@
 
 Each command builds config objects and calls exactly one package function.
 """
+from pathlib import Path
+
 import click
+import torch
 
 from slm import paths
-from slm.config import default_configs
+from slm.config import TrainConfig, default_configs
+from slm.data import build_corpus, load_docs
 from slm.generate import generate as run_generate
 from slm.generate import load_model
 from slm.tokenizer import SimpleTokenizer
+from slm.train import train as run_train
 
 
 @click.group()
@@ -52,10 +57,6 @@ def train(smoke, devices, accelerator, num_nodes, precision, dataloader_workers,
           wandb_project, max_steps, batch_size, lr, compile_, doc_mask, out_dir,
           tokenizer_path, vocab_size, hidden_dim, num_heads, n_layer, block_size):
     """Train a model with Lightning (real run, or a tiny --smoke run)."""
-    from pathlib import Path
-
-    from slm.train import train as run_train
-
     model_cfg, train_cfg = default_configs(smoke=smoke)
 
     for name, val in [("vocab_size", vocab_size), ("hidden_dim", hidden_dim),
@@ -85,8 +86,6 @@ def train(smoke, devices, accelerator, num_nodes, precision, dataloader_workers,
 @click.option("--smoke", is_flag=True, help="Prepare the tiny smoke corpus.")
 def prepare_data(smoke):
     """Encode + cache the train/val corpora once (no GPU), so DDP runs just mmap them."""
-    from slm.data import build_corpus, load_docs
-
     _, cfg = default_configs(smoke=smoke)
     train_docs, val_docs = load_docs(cfg)
     build_corpus(train_docs, cfg.train_path, cfg.tokenizer_path,
@@ -111,8 +110,6 @@ def prepare_data(smoke):
 def generate(checkpoint, prompt, max_new_tokens, temperature, top_p, num_samples, device,
              tokenizer_path):
     """Generate text from a trained checkpoint."""
-    import torch
-
     dev = torch.device(device)
     model, cfg, meta = load_model(checkpoint, dev)
     tok = SimpleTokenizer.load(tokenizer_path)
@@ -135,9 +132,6 @@ def generate(checkpoint, prompt, max_new_tokens, temperature, top_p, num_samples
               help="Random sample of documents to train on.")
 def train_tokenizer(out_path, vocab_size, n_docs):
     """Train a new BPE tokenizer on a random sample of the corpus."""
-    from slm.config import TrainConfig
-    from slm.data import load_docs
-
     cfg = TrainConfig(n_train_docs=n_docs, n_val_docs=0)
     train_docs, _ = load_docs(cfg)
     text = cfg.sep.join(train_docs)
