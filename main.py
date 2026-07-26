@@ -15,8 +15,8 @@ import torch
 from slm import paths
 from slm.config import TrainConfig, default_configs
 from slm.data import build_corpus, load_docs
-from slm.generate import generate as run_generate
 from slm.generate import load_model
+from slm.generate import stream as run_stream
 from slm.tokenizer import HFTokenizer, SimpleTokenizer, load_tokenizer
 from slm.train import train as run_train
 
@@ -168,11 +168,13 @@ def generate(checkpoint, prompt, max_new_tokens, temperature, top_p, num_samples
     click.echo(f"loaded {checkpoint}: step {meta['step']}, val {meta['val']:.3f}, "
                f"{n_params/1e6:.1f}M params\n")
     for i in range(num_samples):
-        text = run_generate(model, tok, prompt=prompt, max_new_tokens=max_new_tokens,
-                            temperature=temperature, top_p=top_p,
-                            block_size=cfg.block_size, device=dev)
         click.echo(f"--- sample {i + 1} (temp {temperature}, top_p {top_p}) ---")
-        click.echo(text.replace("\n<|endoftext|>\n", "\n").strip() + "\n")
+        for chunk in run_stream(model, tok, prompt=prompt, max_new_tokens=max_new_tokens,
+                                temperature=temperature, top_p=top_p,
+                                block_size=cfg.block_size, device=dev):
+            click.echo(chunk, nl=False)
+            click.get_text_stream("stdout").flush()
+        click.echo("\n")
 
 
 @cli.command("train-tokenizer")
