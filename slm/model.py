@@ -194,6 +194,7 @@ class JLM(nn.Module):
         ])
         self.norm = nn.LayerNorm(hidden_dim)
         self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
+        self.lm_head.weight = self.embedding.weight
 
     @classmethod
     def from_config(cls, cfg: ModelConfig) -> "JLM":
