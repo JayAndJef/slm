@@ -68,9 +68,15 @@ class RotaryPositionalEmbedding(nn.Module):
 class MultiheadSelfAttention(nn.Module):
     """Causal multi-head self-attention.
 
-    Projects the input to per-head queries/keys/values, computes scaled dot-product
-    scores, masks out future positions (lower-triangular ``tril`` buffer), softmaxes,
-    and mixes the values. A final projection lets the heads exchange information.
+    Projects the input to per-head queries/keys/values, RMS-normalizes q and k
+    (QK-norm — bounds the attention logits so they cannot grow without limit, which is
+    what lets the learning rate go up), computes scaled dot-product scores, masks out
+    future positions (lower-triangular ``tril`` buffer), softmaxes, and mixes the values.
+    A final projection lets the heads exchange information.
+
+    QK-norm leaves ``self.scale`` alone: normalized q and k give ``q·k`` an RMS of about
+    ``sqrt(head_dim)``, so ``1/sqrt(head_dim)`` — SDPA's and FlexAttention's default — is
+    still the right divisor.
 
     Two interchangeable implementations of that middle step, selected by ``use_sdpa``:
     :meth:`_attend_manual` is the from-scratch version written out longhand, and
@@ -91,8 +97,11 @@ class MultiheadSelfAttention(nn.Module):
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
         self.num_heads = num_heads
-        self.scale = (hidden_dim // num_heads) ** 0.5
-        self.rope = RotaryPositionalEmbedding(hidden_dim // num_heads)
+        head_dim = hidden_dim // num_heads
+        self.scale = head_dim ** 0.5
+        self.q_norm = nn.RMSNorm(head_dim)
+        self.k_norm = nn.RMSNorm(head_dim)
+        self.rope = RotaryPositionalEmbedding(head_dim)
         self.use_sdpa = use_sdpa
 
     def forward(self, x, block_mask=None):
@@ -106,8 +115,8 @@ class MultiheadSelfAttention(nn.Module):
         q = self.q_proj(x).reshape(B, T, self.num_heads, head_dim).transpose(1, 2)
         k = self.k_proj(x).reshape(B, T, self.num_heads, head_dim).transpose(1, 2)
         v = self.v_proj(x).reshape(B, T, self.num_heads, head_dim).transpose(1, 2)
-        q = self.rope(q)   # rotate queries and keys (not values) by position
-        k = self.rope(k)
+        q = self.rope(self.q_norm(q))   # rotate queries and keys (not values) by position
+        k = self.rope(self.k_norm(k))
         if block_mask is not None:
             out = self._attend_flex(q, k, v, block_mask)
         else:
