@@ -73,6 +73,7 @@ def _apply(cfg: ModelConfig | TrainConfig, **opts) -> None:
         if value is None:
             continue
         name = _FIELD_ALIASES.get(name, name)
+        assert hasattr(cfg, name), f"{type(cfg).__name__} has no field {name!r}"
         setattr(cfg, name, Path(value) if name in _PATH_FIELDS else value)
 
 
@@ -130,9 +131,12 @@ def continue_train(init_from, out_dir, **opts):
 
 @cli.command("prepare-data")
 @click.option("--smoke", is_flag=True, help="Prepare the tiny smoke corpus.")
-def prepare_data(smoke):
+@click.option("--tokenizer", "tokenizer_path", type=click.Path(exists=True), default=None,
+              help="Must match train's, or the corpus_hash differs and train re-encodes.")
+def prepare_data(smoke, tokenizer_path):
     """Encode + cache the train/val corpora once (no GPU), so DDP runs just mmap them."""
     _, cfg = default_configs(smoke=smoke)
+    _apply(cfg, tokenizer_path=tokenizer_path)
     train_docs, val_docs = load_docs(cfg)
     build_corpus(train_docs, cfg.train_path, cfg.tokenizer_path,
                  sep=cfg.sep, n_workers=cfg.n_workers, logger=click.echo)
@@ -186,7 +190,7 @@ def generate(checkpoint, prompt, max_new_tokens, temperature, top_p, num_samples
               show_default=True,
               help="hf = rust-backed tokenizers; simple = the from-scratch implementation.")
 def train_tokenizer(out_path, vocab_size, n_docs, backend):
-    """Train a new BPE tokenizer on a random sample of the corpus."""
+    """Train a new BPE tokenizer on a random sample of the corpus, excluding the val split."""
     cfg = TrainConfig(n_train_docs=n_docs)
     train_docs, _ = load_docs(cfg)          # a Dataset; rows are dicts with a "text" key
     click.echo(f"training {backend} tokenizer (vocab {vocab_size}) on "

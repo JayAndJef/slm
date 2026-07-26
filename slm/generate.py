@@ -8,10 +8,10 @@ import torch
 import torch.nn.functional as F
 
 from slm import checkpoint
-from slm.config import ModelConfig
+from slm.config import SEP, ModelConfig
 from slm.model import JLM
 
-EOT = "\n<|endoftext|>\n"       # document boundary: the empty prompt, and the stop marker
+EOT = SEP                       # document boundary: the empty prompt, and the stop marker
 
 
 def load_model(checkpoint_path, device) -> tuple[JLM, ModelConfig, dict]:

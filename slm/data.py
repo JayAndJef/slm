@@ -112,7 +112,9 @@ def build_corpus(docs, cache_path, tokenizer_path, *, sep: str,
         logger(f"encoding {len(docs)} docs -> {cache_path.name} with {n_workers} workers")
     # contiguous=False keeps the round-robin striding the old list slicing used, so the
     # corpus is a stride-permutation of the pool (contiguous=True is what would preserve
-    # pool order) — irrelevant either way, hence n_workers staying out of corpus_hash.
+    # pool order). Which documents are present does not depend on n_workers, but the order
+    # they land in does — hence n_workers staying out of corpus_hash, and hence two machines
+    # with different core counts writing differently-ordered streams to the same filename.
     shards = [docs.shard(n_workers, i, contiguous=False) for i in range(n_workers)]
     # forkserver (not fork) so encoding is safe even if a CUDA/NCCL context already
     # exists in this process (e.g. under DDP). Workers are torch-free regardless.

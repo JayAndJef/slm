@@ -18,6 +18,8 @@ from pathlib import Path
 
 from slm import paths
 
+SEP = "\n<|endoftext|>\n"       # document separator; one token id in the corpus
+
 
 @dataclass
 class ModelConfig:
@@ -63,7 +65,7 @@ class TrainConfig:
     n_val_docs: int = 5_000
     seed: int = 42
     sampler_seed: int | None = None     # window order only; None = follow `seed`
-    sep: str = "\n<|endoftext|>\n"      # literal document separator (one token id in the corpus)
+    sep: str = SEP
     n_workers: int = 16
     tokens_per_byte: float | None = None  # measured from the corpus at setup; drives val_bpb
 
@@ -134,7 +136,8 @@ class TrainConfig:
         """Cached train corpus: tag, both doc counts, and :attr:`corpus_hash`. Train is
         ``pool[n_val_docs:][:n_train_docs]``, so ``n_val_docs`` moves it too."""
         return self.data_dir / (
-            f"train_{self.tag}_{self.n_val_docs}+{self.n_train_docs or 'all'}"
+            f"train_{self.tag}_{self.n_val_docs}"
+            f"+{'all' if self.n_train_docs is None else self.n_train_docs}"
             f"_{self.corpus_hash}.npy")
 
     @property

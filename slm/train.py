@@ -45,9 +45,10 @@ def train(model_cfg: ModelConfig | None, train_cfg: TrainConfig):
     init_state, best = None, float("inf")
     if train_cfg.init_from is not None:
         init_state, model_cfg, meta = checkpoint.load(train_cfg.init_from)
-        if meta["val"] is not None:
-            best = meta["val"]          # only improvements on the source model get saved
-        val_str = "n/a" if meta["val"] is None else f"{meta['val']:.4f}"
+        val = meta["val"]
+        if val is not None:
+            best = val                  # only improvements on the source model get saved
+        val_str = "n/a" if val is None else f"{val:.4f}"
         print(f"continuing from {train_cfg.init_from} "
               f"(step {meta['step']}, val {val_str}) — weights only")
     assert model_cfg is not None, "pass a ModelConfig, or set train_cfg.init_from"
