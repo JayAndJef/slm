@@ -24,8 +24,8 @@ class ModelConfig:
     """The five dimensions that define a JLM transformer's architecture."""
 
     vocab_size: int = 32_000
-    hidden_dim: int = 768
-    num_heads: int = 12
+    hidden_dim: int = 1024
+    num_heads: int = 16
     n_layer: int = 12
     block_size: int = 512
 
@@ -52,8 +52,8 @@ class TrainConfig:
     dataset_mix: dict[str, int | None] = field(default_factory=lambda: {
         "auto_math_text": None,         # 1.95M rows
         "stanford": None,               # 1.02M
-        "stories": 1_000_000,           # of 4.99M
-        "web_samples_v2": 1_000_000,    # of 10.3M
+        "stories": 1_800_000,           # of 4.99M
+        "web_samples_v2": 1_800_000,    # of 10.3M
         "wikihow": None,                # 179k
         "openstax": None,               # 126k
         "khanacademy": None,            # 24k
@@ -66,18 +66,18 @@ class TrainConfig:
     tokens_per_byte: float | None = None  # measured from the corpus at setup; drives val_bpb
 
     # optimization
-    batch_size: int = 160
-    max_steps: int = 6000
-    warmup_steps: int = 150
-    lr: float = 1e-3
-    min_lr: float = 1e-4
+    batch_size: int = 64
+    max_steps: int = 38000
+    warmup_steps: int = 500
+    lr: float = 6e-4
+    min_lr: float = 6e-5
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     compile: bool = True                # torch.compile the model (CUDA only)
     doc_mask: bool = True               # stop attention crossing document boundaries
 
     # eval / checkpoint
-    eval_every: int = 500               # -> Trainer val_check_interval (steps)
+    eval_every: int = 1000               # -> Trainer val_check_interval (steps)
     eval_iters: int = 50                # -> Trainer limit_val_batches
     tag: str = "cosmo"                  # names the cached corpus files
     out_dir: Path = field(default_factory=lambda: paths.CKPT_DIR)
