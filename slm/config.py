@@ -27,7 +27,7 @@ class ModelConfig:
     hidden_dim: int = 1024
     num_heads: int = 16
     n_layer: int = 12
-    block_size: int = 512
+    block_size: int = 1024
 
     @classmethod
     def from_dict(cls, d: dict) -> "ModelConfig":
@@ -66,11 +66,11 @@ class TrainConfig:
     tokens_per_byte: float | None = None  # measured from the corpus at setup; drives val_bpb
 
     # optimization
-    batch_size: int = 64
-    max_steps: int = 38000
-    warmup_steps: int = 500
-    lr: float = 6e-4
-    min_lr: float = 6e-5
+    batch_size: int = 48
+    max_steps: int = 30000
+    warmup_steps: int = 100
+    lr: float = 1e-3
+    min_lr: float = 1e-4
     decay_frac: float = 0.2             # trailing fraction of max_steps spent decaying
     weight_decay: float = 0.1
     grad_clip: float = 1.0
@@ -79,7 +79,7 @@ class TrainConfig:
 
     # eval / checkpoint
     eval_every: int = 1000               # -> Trainer val_check_interval (steps)
-    eval_iters: int = 50                # -> Trainer limit_val_batches
+    eval_iters: int = 18                # -> Trainer limit_val_batches
     tag: str = "cosmo"                  # names the cached corpus files
     out_dir: Path = field(default_factory=lambda: paths.CKPT_DIR)
     data_dir: Path = field(default_factory=lambda: paths.DATA_DIR)
@@ -96,24 +96,32 @@ class TrainConfig:
     wandb_project: str = "jlm"
 
     @property
-    def tokenizer_hash(self) -> str:
-        """Short digest of the tokenizer file, used to key the corpus caches.
+    def corpus_hash(self) -> str:
+        """Short digest of everything that determines the token stream.
 
-        A corpus is only meaningful under the tokenizer that produced it: swapping
-        tokenizers leaves every id in range, so nothing crashes, the loss curve looks
-        normal, and the token stream means nothing. Putting the digest in the filename
-        makes a changed tokenizer build a new cache instead of reusing the old ids.
+        Every input here fails *silently* when it drifts. A changed tokenizer leaves all
+        ids in range, so nothing crashes, the loss curve looks normal, and the stream means
+        nothing. A changed ``dataset_mix`` or ``seed`` reshuffles the pool, which moves the
+        val split — losses stop being comparable with no signal at all. A changed ``sep``
+        changes the boundary token the document mask keys off.
+
+        Folding them into the filename turns each of those into a visible re-encode instead
+        of a wrong run. ``n_workers`` is deliberately absent: it permutes the order shards
+        are concatenated in, but not which documents are present, and windows are shuffled
+        anyway.
         """
-        return hashlib.sha256(Path(self.tokenizer_path).read_bytes()).hexdigest()[:8]
+        key = repr((sorted(self.dataset_mix.items()), self.seed, self.sep, self.dataset_name))
+        return hashlib.sha256(
+            Path(self.tokenizer_path).read_bytes() + key.encode()).hexdigest()[:8]
 
     @property
     def train_path(self) -> Path:
-        """Cached train corpus, keyed by tag, doc cap, and tokenizer."""
-        return self.data_dir / f"train_{self.tag}_{self.n_train_docs or 'all'}_{self.tokenizer_hash}.npy"
+        """Cached train corpus, keyed by tag, doc cap, and :attr:`corpus_hash`."""
+        return self.data_dir / f"train_{self.tag}_{self.n_train_docs or 'all'}_{self.corpus_hash}.npy"
 
     @property
     def val_path(self) -> Path:
-        return self.data_dir / f"val_{self.tag}_{self.n_val_docs}_{self.tokenizer_hash}.npy"
+        return self.data_dir / f"val_{self.tag}_{self.n_val_docs}_{self.corpus_hash}.npy"
 
 
 def default_configs(smoke: bool = False) -> tuple[ModelConfig, TrainConfig]:

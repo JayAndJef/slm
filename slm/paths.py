@@ -16,8 +16,6 @@ PACKAGE_DIR = Path(__file__).resolve().parent          # .../slm/slm
 REPO_ROOT = PACKAGE_DIR.parent                         # .../slm
 
 TOKENIZER_PATH = REPO_ROOT / "data" / "tokenizer-32k.json"
-# The from-scratch fallback (vocab 4096). Stays under notebooks/ because the notebook keeps
-# its own copy of SimpleTokenizer and loads this file by relative path.
 SIMPLE_TOKENIZER_PATH = REPO_ROOT / "notebooks" / "tokenizer.json"
 DATA_DIR = REPO_ROOT / "data"                          # cached encoded corpora (*.npy)
 CKPT_DIR = REPO_ROOT / "checkpoints"                   # model checkpoints (*.pt)
