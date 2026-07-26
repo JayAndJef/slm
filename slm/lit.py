@@ -19,7 +19,8 @@ import torch
 from slm.config import ModelConfig, TrainConfig
 from slm.data import build_corpus, load_docs
 from slm.dataset import build_dataloader
-from slm.model import JLM
+from slm.model import JLM, segment_block_mask
+from slm.tokenizer import SimpleTokenizer
 
 
 def lr_at(step: int, cfg: TrainConfig) -> float:
@@ -78,10 +79,22 @@ class LitJLM(L.LightningModule):
     def on_train_start(self):
         self._t_prev = time.perf_counter()
 
+    def _block_mask(self, seg):
+        """Build the per-step attention mask, or None for plain causal attention.
+
+        Built here rather than inside ``JLM.forward``: it must stay outside torch.compile
+        (create_block_mask traces its own kernel), and building it once per step shares it
+        across all blocks instead of rebuilding it per layer.
+        """
+        if not self.train_cfg.doc_mask:
+            return None
+        return segment_block_mask(seg, compiled=self.train_cfg.compile)
+
     def training_step(self, batch, batch_idx):
-        x, y = batch
-        _, loss = self.model(x, y)
+        x, y, seg = batch
+        _, loss = self.model(x, y, block_mask=self._block_mask(seg))
         self.log("train_loss", loss, prog_bar=True, on_step=True)
+        self.log("segs_per_window", seg.max(-1).values.float().mean() + 1, on_step=True)
         # Throughput across all ranks; x is (batch, block) on this rank.
         now = time.perf_counter()
         if self._t_prev is not None:
@@ -93,8 +106,8 @@ class LitJLM(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, y = batch
-        _, loss = self.model(x, y)
+        x, y, seg = batch
+        _, loss = self.model(x, y, block_mask=self._block_mask(seg))
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
@@ -141,20 +154,36 @@ class SLMDataModule(L.LightningDataModule):
     def setup(self, stage=None):
         self.rank = self.trainer.global_rank
         self.world_size = self.trainer.world_size
+        # The separator's id is tokenizer-specific — derive it, never hardcode it.
+        # encode(sep) returns TWO ids: the tokenizer's split pattern peels the trailing
+        # "\n" off into its own chunk. That trailing newline is not what marks a boundary
+        # in the corpus — build_corpus encodes sep+doc contiguously, so it is absorbed into
+        # the following word and ids[0] (b"\n<|endoftext|>") is the lone boundary token.
+        tok = SimpleTokenizer.load(self.cfg.tokenizer_path)
+        ids = tok.encode(self.cfg.sep)
+        marker = self.cfg.sep.strip().encode()
+        # Guards the one failure that would ruin a run silently: if the tokenizer never
+        # learned the separator as a merge, ids[0] is a bare "\n" (3196 occurrences per 2M
+        # tokens vs 1576), so every newline reads as a document boundary — training still
+        # converges and every conclusion is wrong.
+        assert marker in tok.vocab[ids[0]], (
+            f"separator token {ids[0]} is {tok.vocab[ids[0]]!r}, which does not carry "
+            f"{marker!r} — the tokenizer did not learn {self.cfg.sep!r} as one token")
+        self.sep_id = ids[0]
 
     def train_dataloader(self):
         return build_dataloader(
             self.train_path, block_size=self.model_cfg.block_size,
             batch_size=self.cfg.batch_size, seed=self.cfg.seed,
             rank=self.rank, world_size=self.world_size,
-            num_workers=self.cfg.dataloader_workers)
+            num_workers=self.cfg.dataloader_workers, sep_id=self.sep_id)
 
     def val_dataloader(self):
         return build_dataloader(
             self.val_path, block_size=self.model_cfg.block_size,
             batch_size=self.cfg.batch_size, seed=self.cfg.seed + 10_000,
             rank=self.rank, world_size=self.world_size,
-            num_workers=self.cfg.dataloader_workers)
+            num_workers=self.cfg.dataloader_workers, sep_id=self.sep_id)
 
 
 class CompactCheckpoint(L.Callback):

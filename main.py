@@ -37,6 +37,8 @@ def cli():
 @click.option("--lr", type=float, default=None)
 @click.option("--compile/--no-compile", "compile_", default=None,
               help="torch.compile the model (default on for real runs).")
+@click.option("--doc-mask/--no-doc-mask", "doc_mask", default=None,
+              help="Stop attention crossing document boundaries (default on).")
 @click.option("--out-dir", type=click.Path(), default=None, help="Checkpoint output dir.")
 @click.option("--tokenizer", "tokenizer_path", type=click.Path(exists=True), default=None)
 # ModelConfig overrides (default None -> only applied when explicitly passed, so
@@ -47,8 +49,8 @@ def cli():
 @click.option("--n-layer", type=int, default=None)
 @click.option("--block-size", type=int, default=None)
 def train(smoke, devices, accelerator, num_nodes, precision, dataloader_workers, wandb,
-          wandb_project, max_steps, batch_size, lr, compile_, out_dir, tokenizer_path,
-          vocab_size, hidden_dim, num_heads, n_layer, block_size):
+          wandb_project, max_steps, batch_size, lr, compile_, doc_mask, out_dir,
+          tokenizer_path, vocab_size, hidden_dim, num_heads, n_layer, block_size):
     """Train a model with Lightning (real run, or a tiny --smoke run)."""
     from pathlib import Path
 
@@ -66,7 +68,7 @@ def train(smoke, devices, accelerator, num_nodes, precision, dataloader_workers,
                       ("dataloader_workers", dataloader_workers),
                       ("wandb_project", wandb_project),
                       ("max_steps", max_steps), ("batch_size", batch_size),
-                      ("lr", lr), ("compile", compile_)]:
+                      ("lr", lr), ("compile", compile_), ("doc_mask", doc_mask)]:
         if val is not None:
             setattr(train_cfg, name, val)
     if wandb:                       # is_flag: only turn on when passed

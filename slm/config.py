@@ -64,6 +64,7 @@ class TrainConfig:
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     compile: bool = True                # torch.compile the model (CUDA only)
+    doc_mask: bool = True               # stop attention crossing document boundaries
 
     # eval / checkpoint
     eval_every: int = 500               # -> Trainer val_check_interval (steps)
