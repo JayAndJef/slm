@@ -31,7 +31,7 @@ def top_p_filter(probs: torch.Tensor, top_p: float) -> torch.Tensor:
     """Nucleus filter: keep the smallest set of tokens whose cumulative probability
     reaches ``top_p``, zero the rest, and renormalize.
 
-    Sampling from the full 4096-way softmax means the long tail of implausible tokens
+    Sampling from the full 32k-way softmax means the long tail of implausible tokens
     still gets picked occasionally — and one bad token stays in the context and degrades
     everything after it. Unlike top-k the kept set is adaptive: narrow where the model is
     confident, wide where it genuinely isn't.
@@ -57,7 +57,7 @@ def stream(model, tokenizer, *, prompt: str = EOT,
     """
     stop_id = tokenizer.sep_id(EOT)
     ids = torch.tensor([tokenizer.encode(prompt)], device=device)
-    new, emitted = [], 0
+    pending = []
 
     for _ in range(max_new_tokens):
         logits, _ = model(ids[:, -block_size:])          # crop to the context window
@@ -68,11 +68,11 @@ def stream(model, tokenizer, *, prompt: str = EOT,
         if int(nxt) == stop_id:
             return
         ids = torch.cat([ids, nxt], dim=1)
-        new.append(int(nxt))
-        text = tokenizer.decode(new)
-        if not text.endswith("�"):                  # a character spanning two tokens
-            yield text[emitted:]
-            emitted = len(text)
+        pending.append(int(nxt))
+        chunk = tokenizer.decode(pending)
+        if not chunk.endswith("�"):                 # a character spanning two tokens
+            yield chunk
+            pending.clear()
 
 
 def generate(model, tokenizer, **kwargs) -> str:

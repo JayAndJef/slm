@@ -6,7 +6,7 @@ Public API, organized by concern:
 - tokenizer : :func:`load_tokenizer` (picks a backend from the file), :class:`HFTokenizer`
               (rust, the default), :class:`SimpleTokenizer` (from scratch, the fallback)
 - model     : :class:`JLM`
-- data      : :func:`load_docs`, :func:`build_corpus`, :func:`get_batch`
+- data      : :func:`load_docs`, :func:`build_corpus`
 - checkpoint: the compact ``{model, step, val, config}`` format — save/load
 - train     : :func:`train` (Lightning driver); :mod:`slm.lit` has LitJLM/SLMDataModule
 - generate  : :func:`generate` (whole string), :func:`stream` (incremental), :func:`load_model`
@@ -15,7 +15,7 @@ See ``main.py`` at the repo root for the CLI entrypoint.
 """
 from slm import checkpoint, paths
 from slm.config import ModelConfig, TrainConfig, default_configs
-from slm.data import build_corpus, get_batch, load_docs
+from slm.data import build_corpus, load_docs
 from slm.generate import generate, load_model, stream
 from slm.model import JLM
 from slm.tokenizer import HFTokenizer, SimpleTokenizer, Tokenizer, load_tokenizer
@@ -26,7 +26,7 @@ __all__ = [
     "ModelConfig", "TrainConfig", "default_configs",
     "Tokenizer", "load_tokenizer", "HFTokenizer", "SimpleTokenizer",
     "JLM",
-    "load_docs", "build_corpus", "get_batch",
+    "load_docs", "build_corpus",
     "train",
     "generate", "stream", "load_model",
 ]

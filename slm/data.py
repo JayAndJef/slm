@@ -1,11 +1,10 @@
 """Corpus preparation and batching.
 
-Three responsibilities, all filesystem/data — no model or training logic:
+Two responsibilities, all filesystem/data — no model or training logic:
 
-- :func:`load_docs` pulls a random sample of documents from fineweb-edu.
+- :func:`load_docs` pulls a random sample of documents from ``cfg.dataset_mix``.
 - :func:`build_corpus` encodes documents to a flat ``uint16`` token stream in parallel
   and caches it to disk as a memmap (re-runs are instant).
-- :func:`get_batch` samples random fixed-length ``(x, y)`` windows for training.
 
 The worker functions live at module top level (not closures/lambdas) so they pickle by
 qualified name for :class:`~concurrent.futures.ProcessPoolExecutor`. The tokenizer is
@@ -17,7 +16,6 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
-import torch
 from datasets import Dataset, concatenate_datasets, load_dataset
 
 from slm.config import TrainConfig
@@ -112,8 +110,9 @@ def build_corpus(docs, cache_path, tokenizer_path, *, sep: str,
 
     if logger:
         logger(f"encoding {len(docs)} docs -> {cache_path.name} with {n_workers} workers")
-    # contiguous=False keeps the round-robin striding the old list slicing used, so worker
-    # order still reconstructs the pool's (already shuffled) document order.
+    # contiguous=False keeps the round-robin striding the old list slicing used, so the
+    # corpus is a stride-permutation of the pool (contiguous=True is what would preserve
+    # pool order) — irrelevant either way, hence n_workers staying out of corpus_hash.
     shards = [docs.shard(n_workers, i, contiguous=False) for i in range(n_workers)]
     # forkserver (not fork) so encoding is safe even if a CUDA/NCCL context already
     # exists in this process (e.g. under DDP). Workers are torch-free regardless.
@@ -129,17 +128,3 @@ def build_corpus(docs, cache_path, tokenizer_path, *, sep: str,
     if logger:
         logger(f"encoded {len(arr)/1e6:.1f}M tokens")
     return np.load(cache_path, mmap_mode="r")
-
-
-def get_batch(data: np.ndarray, batch_size: int, block_size: int, device):
-    """Sample ``batch_size`` random ``(x, y)`` windows of length ``block_size``.
-
-    ``y`` is ``x`` shifted one token (the next-token targets). ``data`` is a flat token
-    array (e.g. a memmap); batches are cast to int64 and moved to ``device``.
-    """
-    idx = torch.randint(0, len(data) - block_size - 1, (batch_size,))
-    x = np.stack([data[i:i + block_size] for i in idx])
-    y = np.stack([data[i + 1:i + 1 + block_size] for i in idx])
-    x = torch.from_numpy(x.astype(np.int64)).to(device, non_blocking=True)
-    y = torch.from_numpy(y.astype(np.int64)).to(device, non_blocking=True)
-    return x, y

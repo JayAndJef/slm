@@ -20,7 +20,8 @@ SIMPLE_TOKENIZER_PATH = REPO_ROOT / "notebooks" / "tokenizer.json"
 DATA_DIR = REPO_ROOT / "data"                          # cached encoded corpora (*.npy)
 CKPT_DIR = REPO_ROOT / "checkpoints"                   # model checkpoints (*.pt)
 
-# Machine-specific HuggingFace cache; override via TrainConfig / CLI if needed.
+# Machine-specific HuggingFace cache. Read twice — HF_HOME below and
+# TrainConfig.hf_cache_dir — so setting only the field splits the cache in two.
 HF_CACHE_DIR = "/data/zejiaqi/huggingface-cache"
 
 # Must be set BEFORE huggingface_hub is imported: it resolves HF_HOME into module

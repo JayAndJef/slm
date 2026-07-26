@@ -2,6 +2,7 @@
 
     uv run main.py train [--smoke] [--hidden-dim N ...]
     uv run main.py continue-train --init-from PATH --out-dir PATH
+    uv run main.py prepare-data [--smoke]
     uv run main.py generate [--checkpoint PATH] [--prompt STR]
     uv run main.py train-tokenizer --out PATH
 
@@ -13,9 +14,9 @@ import click
 import torch
 
 from slm import paths
-from slm.config import TrainConfig, default_configs
+from slm.config import ModelConfig, TrainConfig, default_configs
 from slm.data import build_corpus, load_docs
-from slm.generate import load_model
+from slm.generate import EOT, load_model
 from slm.generate import stream as run_stream
 from slm.tokenizer import HFTokenizer, SimpleTokenizer, load_tokenizer
 from slm.train import train as run_train
@@ -66,7 +67,7 @@ def training_options(f):
     return f
 
 
-def _apply(cfg: TrainConfig, **opts) -> None:
+def _apply(cfg: ModelConfig | TrainConfig, **opts) -> None:
     """Set every explicitly-passed option on ``cfg``; ``None`` means 'not passed'."""
     for name, value in opts.items():
         if value is None:
@@ -93,11 +94,8 @@ def cli():
 def train(smoke, out_dir, vocab_size, hidden_dim, num_heads, n_layer, block_size, **opts):
     """Train a model from scratch with Lightning (or a tiny --smoke run)."""
     model_cfg, train_cfg = default_configs(smoke=smoke)
-    for name, value in [("vocab_size", vocab_size), ("hidden_dim", hidden_dim),
-                        ("num_heads", num_heads), ("n_layer", n_layer),
-                        ("block_size", block_size)]:
-        if value is not None:
-            setattr(model_cfg, name, value)
+    _apply(model_cfg, vocab_size=vocab_size, hidden_dim=hidden_dim,
+           num_heads=num_heads, n_layer=n_layer, block_size=block_size)
     _apply(train_cfg, out_dir=out_dir, **opts)
     run_train(model_cfg, train_cfg)
 
@@ -145,7 +143,7 @@ def prepare_data(smoke):
 @cli.command()
 @click.option("--checkpoint", type=click.Path(exists=True),
               default=str(paths.CKPT_DIR / "best.pt"), show_default=True)
-@click.option("--prompt", default="\n<|endoftext|>\n", help="Text to continue.")
+@click.option("--prompt", default=EOT, help="Text to continue.")
 @click.option("--max-new-tokens", type=int, default=250)
 @click.option("--temperature", type=float, default=0.8)
 @click.option("--top-p", type=float, default=0.9, show_default=True,
@@ -165,7 +163,8 @@ def generate(checkpoint, prompt, max_new_tokens, temperature, top_p, num_samples
         f"checkpoint has vocab {cfg.vocab_size} but {tokenizer_path} has {tok.n_vocab} — "
         f"pass --tokenizer for the one this model was trained with")
     n_params = sum(p.numel() for p in model.parameters())
-    click.echo(f"loaded {checkpoint}: step {meta['step']}, val {meta['val']:.3f}, "
+    val_str = "n/a" if meta["val"] is None else f"{meta['val']:.3f}"
+    click.echo(f"loaded {checkpoint}: step {meta['step']}, val {val_str}, "
                f"{n_params/1e6:.1f}M params\n")
     for i in range(num_samples):
         click.echo(f"--- sample {i + 1} (temp {temperature}, top_p {top_p}) ---")
@@ -188,7 +187,7 @@ def generate(checkpoint, prompt, max_new_tokens, temperature, top_p, num_samples
               help="hf = rust-backed tokenizers; simple = the from-scratch implementation.")
 def train_tokenizer(out_path, vocab_size, n_docs, backend):
     """Train a new BPE tokenizer on a random sample of the corpus."""
-    cfg = TrainConfig(n_train_docs=n_docs, n_val_docs=0)
+    cfg = TrainConfig(n_train_docs=n_docs)
     train_docs, _ = load_docs(cfg)          # a Dataset; rows are dicts with a "text" key
     click.echo(f"training {backend} tokenizer (vocab {vocab_size}) on "
                f"{len(train_docs)} docs ...")

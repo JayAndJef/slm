@@ -186,19 +186,18 @@ class SLMDataModule(L.LightningDataModule):
         sample = np.load(self.val_path, mmap_mode="r")[:200_000]
         self.cfg.tokens_per_byte = len(sample) / max(1, len(tok.decode(sample.tolist()).encode()))
 
-    def train_dataloader(self):
+    def _loader(self, path, seed: int):
         return build_dataloader(
-            self.train_path, block_size=self.model_cfg.block_size,
-            batch_size=self.cfg.batch_size, seed=self.cfg.window_seed,
+            path, block_size=self.model_cfg.block_size,
+            batch_size=self.cfg.batch_size, seed=seed,
             rank=self.rank, world_size=self.world_size,
             num_workers=self.cfg.dataloader_workers, sep_id=self.sep_id)
 
+    def train_dataloader(self):
+        return self._loader(self.train_path, self.cfg.window_seed)
+
     def val_dataloader(self):
-        return build_dataloader(
-            self.val_path, block_size=self.model_cfg.block_size,
-            batch_size=self.cfg.batch_size, seed=self.cfg.seed + 10_000,
-            rank=self.rank, world_size=self.world_size,
-            num_workers=self.cfg.dataloader_workers, sep_id=self.sep_id)
+        return self._loader(self.val_path, self.cfg.seed + 10_000)
 
 
 class CompactCheckpoint(L.Callback):

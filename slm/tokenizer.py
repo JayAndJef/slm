@@ -29,7 +29,7 @@ import os
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Iterable, Protocol, runtime_checkable
+from typing import Iterable, Protocol
 
 # Aliased: this module defines its own `Tokenizer` protocol, and the rust class would
 # otherwise shadow it.
@@ -42,7 +42,6 @@ from tokenizers import decoders, models, pre_tokenizers, trainers
 SPLIT_PATTERN = re.compile(r"\s*\S+|\s+")
 
 
-@runtime_checkable
 class Tokenizer(Protocol):
     """What the rest of the codebase actually needs from a tokenizer.
 
@@ -137,18 +136,18 @@ class SimpleTokenizer:
                 if sign > 0:
                     where.setdefault(pair, set()).add(idx)
 
-    def _merge(self, text: list[int], pair: tuple[int, int], new_id: int) -> list[int]:
+    def _merge(self, ids: list[int], pair: tuple[int, int], new_id: int) -> list[int]:
         """Replace every non-overlapping occurrence of ``pair`` with ``new_id``."""
-        new_text: list[int] = []
+        out: list[int] = []
         i = 0
-        while i < len(text):
-            if text[i] == pair[0] and i < len(text) - 1 and text[i + 1] == pair[1]:
-                new_text.append(new_id)
+        while i < len(ids):
+            if ids[i] == pair[0] and i < len(ids) - 1 and ids[i + 1] == pair[1]:
+                out.append(new_id)
                 i += 2
             else:
-                new_text.append(text[i])
+                out.append(ids[i])
                 i += 1
-        return new_text
+        return out
 
     # ------------------------------------------------------------------ encode / decode
     def _encode_chunk(self, chunk: str) -> list[int]:
@@ -202,6 +201,7 @@ class SimpleTokenizer:
 
     # ------------------------------------------------------------------ persistence
     def save(self, path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(
                 {"vocab_size": self.vocab_size,
@@ -256,8 +256,8 @@ class HFTokenizer:
         return self._tk.encode(text).ids
 
     def decode(self, tokens: list[int]) -> str:
-        # skip_special_tokens defaults to True, which would delete the separator from
-        # generated text and silently turn main.py's boundary strip into a no-op.
+        # skip_special_tokens defaults to True, which would drop every separator from a
+        # decoded corpus slice and silently bias SLMDataModule.setup's tokens_per_byte.
         return self._tk.decode(tokens, skip_special_tokens=False)
 
     # ------------------------------------------------------------------ protocol

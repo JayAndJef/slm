@@ -6,7 +6,7 @@ data-parallel (DDP): pass ``devices`` as a count or a comma-list of PyTorch devi
 """
 import lightning as L
 import torch
-from lightning.pytorch.callbacks import LearningRateMonitor, RichProgressBar
+from lightning.pytorch.callbacks import RichProgressBar
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 from slm import checkpoint
@@ -47,8 +47,9 @@ def train(model_cfg: ModelConfig | None, train_cfg: TrainConfig):
         init_state, model_cfg, meta = checkpoint.load(train_cfg.init_from)
         if meta["val"] is not None:
             best = meta["val"]          # only improvements on the source model get saved
+        val_str = "n/a" if meta["val"] is None else f"{meta['val']:.4f}"
         print(f"continuing from {train_cfg.init_from} "
-              f"(step {meta['step']}, val {meta['val']:.4f}) — weights only")
+              f"(step {meta['step']}, val {val_str}) — weights only")
     assert model_cfg is not None, "pass a ModelConfig, or set train_cfg.init_from"
 
     n_vocab = load_tokenizer(train_cfg.tokenizer_path).n_vocab
@@ -77,7 +78,6 @@ def train(model_cfg: ModelConfig | None, train_cfg: TrainConfig):
         callbacks=[
             CompactCheckpoint(train_cfg.out_dir, model_cfg, best=best),
             RichProgressBar(),
-            LearningRateMonitor(logging_interval="step"),
         ],
         logger=_make_logger(train_cfg),
     )

@@ -87,7 +87,8 @@ def build_dataloader(cache_path, *, block_size: int, batch_size: int, seed: int,
                      rank: int = 0, world_size: int = 1, num_workers: int = 0,
                      sep_id: int | None = None) -> DataLoader:
     """DataLoader over :class:`WindowIterableDataset`; default collate stacks windows."""
-    ds = WindowIterableDataset(cache_path, block_size, seed, rank, world_size, sep_id)
+    ds = WindowIterableDataset(cache_path, block_size=block_size, base_seed=seed,
+                               rank=rank, world_size=world_size, sep_id=sep_id)
     return DataLoader(
         ds, batch_size=batch_size, num_workers=num_workers, pin_memory=True,
         persistent_workers=num_workers > 0,

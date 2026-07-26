@@ -33,8 +33,9 @@ class ModelConfig:
     def from_dict(cls, d: dict) -> "ModelConfig":
         """Build from a (possibly extra-keyed) dict, ignoring unknown fields.
 
-        Filtering rather than ``cls(**d)`` keeps old checkpoints loadable if future
-        configs gain new fields.
+        Filtering rather than ``cls(**d)`` covers dicts carrying keys this class lacks,
+        where ``cls(**d)`` raises; a dict merely *missing* a field already loads, since
+        the dataclass default fills it in.
         """
         known = {f.name for f in dataclasses.fields(cls)}
         return cls(**{k: v for k, v in d.items() if k in known})
@@ -130,8 +131,11 @@ class TrainConfig:
 
     @property
     def train_path(self) -> Path:
-        """Cached train corpus, keyed by tag, doc cap, and :attr:`corpus_hash`."""
-        return self.data_dir / f"train_{self.tag}_{self.n_train_docs or 'all'}_{self.corpus_hash}.npy"
+        """Cached train corpus: tag, both doc counts, and :attr:`corpus_hash`. Train is
+        ``pool[n_val_docs:][:n_train_docs]``, so ``n_val_docs`` moves it too."""
+        return self.data_dir / (
+            f"train_{self.tag}_{self.n_val_docs}+{self.n_train_docs or 'all'}"
+            f"_{self.corpus_hash}.npy")
 
     @property
     def val_path(self) -> Path:
