@@ -20,7 +20,7 @@ from slm.config import ModelConfig, TrainConfig
 from slm.data import build_corpus, load_docs
 from slm.dataset import build_dataloader
 from slm.model import JLM, segment_block_mask
-from slm.tokenizer import SimpleTokenizer
+from slm.tokenizer import load_tokenizer
 
 
 def lr_at(step: int, cfg: TrainConfig) -> float:
@@ -109,6 +109,9 @@ class LitJLM(L.LightningModule):
         x, y, seg = batch
         _, loss = self.model(x, y, block_mask=self._block_mask(seg))
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)
+        tpb = self.train_cfg.tokens_per_byte
+        if tpb:
+            self.log("val_bpb", loss * tpb / math.log(2), prog_bar=True, sync_dist=True)
         return loss
 
     def configure_optimizers(self):
@@ -153,22 +156,14 @@ class SLMDataModule(L.LightningDataModule):
     def setup(self, stage=None):
         self.rank = self.trainer.global_rank
         self.world_size = self.trainer.world_size
-        # The separator's id is tokenizer-specific — derive it, never hardcode it.
-        # encode(sep) returns TWO ids: the tokenizer's split pattern peels the trailing
-        # "\n" off into its own chunk. That trailing newline is not what marks a boundary
-        # in the corpus — build_corpus encodes sep+doc contiguously, so it is absorbed into
-        # the following word and ids[0] (b"\n<|endoftext|>") is the lone boundary token.
-        tok = SimpleTokenizer.load(self.cfg.tokenizer_path)
-        ids = tok.encode(self.cfg.sep)
-        marker = self.cfg.sep.strip().encode()
-        # Guards the one failure that would ruin a run silently: if the tokenizer never
-        # learned the separator as a merge, ids[0] is a bare "\n" (3196 occurrences per 2M
-        # tokens vs 1576), so every newline reads as a document boundary — training still
-        # converges and every conclusion is wrong.
-        assert marker in tok.vocab[ids[0]], (
-            f"separator token {ids[0]} is {tok.vocab[ids[0]]!r}, which does not carry "
-            f"{marker!r} — the tokenizer did not learn {self.cfg.sep!r} as one token")
-        self.sep_id = ids[0]
+        # The boundary id is tokenizer-specific — each backend derives it in its own
+        # vocabulary and asserts it is a single token (see Tokenizer.sep_id).
+        tok = load_tokenizer(self.cfg.tokenizer_path)
+        self.sep_id = tok.sep_id(self.cfg.sep)
+        # Tokens per byte, measured off the real corpus, so val loss can be reported as
+        # bits per byte — the only figure comparable across vocab sizes.
+        sample = np.load(self.val_path, mmap_mode="r")[:200_000]
+        self.cfg.tokens_per_byte = len(sample) / max(1, len(tok.decode(sample.tolist()).encode()))
 
     def train_dataloader(self):
         return build_dataloader(

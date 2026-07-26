@@ -1,10 +1,20 @@
 """Streaming windows from a cached token corpus for DDP training.
 
-The corpus is a flat 1-D ``uint16`` memmap. Training samples random fixed-length windows
-from it (next-token targets are the same window shifted by one). Under DDP each rank —
-and each DataLoader worker within a rank — must draw a *different* random stream, or the
-gradient estimate is biased by replayed windows. :class:`WindowIterableDataset` folds the
-rank and worker id into its RNG seed to guarantee that.
+The corpus is a flat 1-D ``uint16`` memmap, cut into non-overlapping fixed-length windows
+(next-token targets are the same window shifted by one). Each pass shuffles the window
+order and hands every reader a disjoint slice of it, so within a pass no window is ever
+served twice and none is skipped.
+
+That is worth the small amount of bookkeeping. Drawing random offsets *with replacement* —
+the obvious alternative — wastes part of the budget re-reading windows it has already
+served: drawing N tokens' worth from a corpus of M covers only ``1 - exp(-N/M)`` of it, so
+at N/M = 1/3 you touch 28% of the corpus instead of 33%. It also has no resumable position
+and no real notion of an epoch.
+
+Every reader derives the *same* permutation from ``(base_seed, epoch)`` and then takes
+``order[shard::n_shards]``. Note the inversion from a with-replacement sampler: the RNG
+must be **identical** across ranks and workers so they agree on the ordering, and it is the
+shard index — not the seed — that keeps them from colliding.
 
 This module depends only on torch/numpy; it knows nothing about the model or Lightning.
 """
@@ -47,21 +57,30 @@ class WindowIterableDataset(IterableDataset):
 
     def __iter__(self):
         info = get_worker_info()
+        n_workers = info.num_workers if info is not None else 1
         worker_id = info.id if info is not None else 0
-        # Distinct RNG stream per (rank, worker); stable across persistent_workers.
-        seed = (self.base_seed * 2654435761 + self.rank * 1000003 + worker_id) & 0xFFFFFFFF
-        rng = np.random.default_rng(seed)
+        shard, n_shards = self.rank * n_workers + worker_id, self.world_size * n_workers
+
         data = np.load(self.cache_path, mmap_mode="r")
-        hi = len(data) - self.block_size - 1
         bs = self.block_size
+        # -1 leaves the one extra token that y's shift needs past the last window.
+        n_windows = (len(data) - 1) // bs
+        assert n_windows >= n_shards, (
+            f"corpus holds {n_windows} windows of {bs} tokens but there are {n_shards} "
+            f"readers ({self.world_size} ranks x {n_workers} workers) — some would idle")
+
+        epoch = 0
         while True:
-            i = int(rng.integers(0, hi))
-            x = torch.from_numpy(data[i:i + bs].astype(np.int64))
-            y = torch.from_numpy(data[i + 1:i + 1 + bs].astype(np.int64))
-            # Emitted unconditionally (all zeros when sep_id is None) so the batch arity
-            # never depends on config. A BlockMask cannot travel this path — it carries a
-            # Python closure and would not survive the worker's shared-memory pickling.
-            yield x, y, segment_ids(x, self.sep_id)
+            order = np.random.default_rng((self.base_seed, epoch)).permutation(n_windows)
+            for w in order[shard::n_shards]:
+                i = int(w) * bs
+                x = torch.from_numpy(data[i:i + bs].astype(np.int64))
+                y = torch.from_numpy(data[i + 1:i + 1 + bs].astype(np.int64))
+                # Emitted unconditionally (all zeros when sep_id is None) so the batch
+                # arity never depends on config. A BlockMask cannot travel this path — it
+                # carries a Python closure and would not survive shared-memory pickling.
+                yield x, y, segment_ids(x, self.sep_id)
+            epoch += 1
 
 
 def build_dataloader(cache_path, *, block_size: int, batch_size: int, seed: int,

@@ -16,7 +16,7 @@ from slm.config import TrainConfig, default_configs
 from slm.data import build_corpus, load_docs
 from slm.generate import generate as run_generate
 from slm.generate import load_model
-from slm.tokenizer import SimpleTokenizer
+from slm.tokenizer import HFTokenizer, SimpleTokenizer, load_tokenizer
 from slm.train import train as run_train
 
 
@@ -112,7 +112,10 @@ def generate(checkpoint, prompt, max_new_tokens, temperature, top_p, num_samples
     """Generate text from a trained checkpoint."""
     dev = torch.device(device)
     model, cfg, meta = load_model(checkpoint, dev)
-    tok = SimpleTokenizer.load(tokenizer_path)
+    tok = load_tokenizer(tokenizer_path)
+    assert cfg.vocab_size == tok.n_vocab, (
+        f"checkpoint has vocab {cfg.vocab_size} but {tokenizer_path} has {tok.n_vocab} — "
+        f"pass --tokenizer for the one this model was trained with")
     n_params = sum(p.numel() for p in model.parameters())
     click.echo(f"loaded {checkpoint}: step {meta['step']}, val {meta['val']:.3f}, "
                f"{n_params/1e6:.1f}M params\n")
@@ -127,20 +130,27 @@ def generate(checkpoint, prompt, max_new_tokens, temperature, top_p, num_samples
 @cli.command("train-tokenizer")
 @click.option("--out", "out_path", type=click.Path(), required=True,
               help="Where to save the tokenizer JSON (required — never defaults to the kept one).")
-@click.option("--vocab-size", type=int, default=4096, show_default=True)
+@click.option("--vocab-size", type=int, default=32_000, show_default=True)
 @click.option("--n-docs", type=int, default=10000, show_default=True,
               help="Random sample of documents to train on.")
-def train_tokenizer(out_path, vocab_size, n_docs):
+@click.option("--backend", type=click.Choice(["hf", "simple"]), default="hf",
+              show_default=True,
+              help="hf = rust-backed tokenizers; simple = the from-scratch implementation.")
+def train_tokenizer(out_path, vocab_size, n_docs, backend):
     """Train a new BPE tokenizer on a random sample of the corpus."""
     cfg = TrainConfig(n_train_docs=n_docs, n_val_docs=0)
     train_docs, _ = load_docs(cfg)
-    text = cfg.sep.join(train_docs)
-    tok = SimpleTokenizer(vocab_size=vocab_size)
-    click.echo(f"training tokenizer (vocab {vocab_size}) on {n_docs} docs "
-               f"({len(text.encode())/1e6:.1f} MB) ...")
-    tok.train_tokenizer(text)
+    mb = sum(len(d.encode()) for d in train_docs) / 1e6
+    click.echo(f"training {backend} tokenizer (vocab {vocab_size}) on {len(train_docs)} "
+               f"docs ({mb:.1f} MB) ...")
+    if backend == "hf":
+        tok = HFTokenizer.train(train_docs, vocab_size=vocab_size, special=cfg.sep.strip())
+    else:
+        tok = SimpleTokenizer(vocab_size=vocab_size)
+        tok.train_tokenizer(cfg.sep.join(train_docs))
     tok.save(out_path)
-    click.echo(f"saved -> {out_path} ({len(tok.vocab)} tokens)")
+    click.echo(f"saved -> {out_path} ({tok.n_vocab} tokens, "
+               f"sep_id {tok.sep_id(cfg.sep)})")
 
 
 if __name__ == "__main__":

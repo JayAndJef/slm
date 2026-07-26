@@ -9,7 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
-# Data & model artifacts (large, local-only). notebooks/tokenizer.json is kept (no *.json rule).
+# Data & model artifacts (large, local-only). data/ holds the encoded corpora and the
+# trained tokenizer; notebooks/tokenizer.json is still tracked (no *.json rule).
+# NOTE: a checkpoint is unusable without the tokenizer that produced its ids, so
+# data/tokenizer-32k.json has to be distributed alongside any published weights.
 data/
 *.npy
 checkpoints/

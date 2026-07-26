@@ -21,16 +21,17 @@ import torch
 from datasets import concatenate_datasets, load_dataset
 
 from slm.config import TrainConfig
-from slm.tokenizer import SimpleTokenizer
+from slm.tokenizer import Tokenizer, load_tokenizer
 
 # Per-worker state, set by the pool initializer.
-_WORKER_TOK: SimpleTokenizer | None = None
+_WORKER_TOK: Tokenizer | None = None
 _WORKER_SEP: str = ""
 
 
 def _worker_init(tokenizer_path, sep: str) -> None:
     global _WORKER_TOK, _WORKER_SEP
-    _WORKER_TOK = SimpleTokenizer.load(tokenizer_path)
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    _WORKER_TOK = load_tokenizer(tokenizer_path)
     _WORKER_SEP = sep
 
 
@@ -67,7 +68,7 @@ def load_docs(cfg: TrainConfig) -> tuple[list[str], list[str]]:
     does change the pool, and therefore the val set — so losses are only comparable across
     runs that share a mix.
     """
-    os.environ["HF_HOME"] = cfg.hf_cache_dir
+    # HF_HOME is set in slm.paths, before huggingface_hub is imported — see the note there.
     parts = []
     for name, cap in cfg.dataset_mix.items():
         ds = load_dataset(cfg.dataset_name, name=name, split="train",
@@ -99,6 +100,13 @@ def build_corpus(docs: list[str], cache_path, tokenizer_path, *, sep: str,
         if logger:
             logger(f"loaded cached corpus {cache_path.name} ({len(arr)/1e6:.1f}M tokens)")
         return arr
+
+    # The corpus is uint16. numpy would raise on overflow anyway, but only inside a worker
+    # after the whole encode — check up front, where the message is actionable.
+    n_vocab = load_tokenizer(tokenizer_path).n_vocab
+    assert n_vocab <= 65536, (
+        f"tokenizer has {n_vocab} ids, which does not fit the uint16 corpus "
+        f"(max 65536) — widen the dtype in build_corpus and dataset.py")
 
     if logger:
         logger(f"encoding {len(docs)} docs -> {cache_path.name} with {n_workers} workers")

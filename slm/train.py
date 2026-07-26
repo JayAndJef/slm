@@ -11,6 +11,7 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 from slm.config import ModelConfig, TrainConfig
 from slm.lit import CompactCheckpoint, LitJLM, SLMDataModule
+from slm.tokenizer import load_tokenizer
 
 
 def _parse_devices(spec: str):
@@ -29,6 +30,11 @@ def _make_logger(cfg: TrainConfig):
 
 def train(model_cfg: ModelConfig, train_cfg: TrainConfig):
     """Fit a model with Lightning; returns the path to the compact best checkpoint."""
+    n_vocab = load_tokenizer(train_cfg.tokenizer_path).n_vocab
+    assert model_cfg.vocab_size == n_vocab, (
+        f"model vocab_size {model_cfg.vocab_size} != tokenizer {n_vocab} "
+        f"({train_cfg.tokenizer_path})")
+
     torch.set_float32_matmul_precision("high")   # use Tensor Cores for fp32 matmuls
     devices = _parse_devices(train_cfg.devices)
     n_devices = len(devices) if isinstance(devices, list) else devices

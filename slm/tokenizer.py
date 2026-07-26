@@ -1,9 +1,17 @@
-"""Byte-level BPE tokenizer, implemented from scratch.
+"""Byte-level BPE tokenizers: a fast rust-backed one, and one written from scratch.
 
-This is the single canonical tokenizer for the project (the notebook keeps its own
-self-contained copy). It is deliberately **torch-free** — it imports only the standard
-library — so that corpus-encoding worker processes stay lightweight and never pull a
-CUDA context into a forked child.
+Two interchangeable backends behind the :class:`Tokenizer` protocol:
+
+- :class:`HFTokenizer` — wraps HuggingFace ``tokenizers`` (rust). The **default**, and what
+  a 32k vocab over ~15 GiB of text needs to be practical.
+- :class:`SimpleTokenizer` — the from-scratch implementation this project exists to teach.
+  Still fully usable: point ``--tokenizer`` at a file it saved.
+
+:func:`load_tokenizer` picks the backend by looking at the file, since the two on-disk
+formats are disjoint. Nothing else in the codebase needs to know which is in use.
+
+Both are **torch-free** — only the standard library plus (lazily) ``tokenizers`` — so
+corpus-encoding workers stay lightweight and never pull a CUDA context into a child.
 
 Design:
 - The base vocabulary is the 256 byte values, so any UTF-8 text encodes without an
@@ -17,13 +25,60 @@ Design:
   decodes once with ``errors="replace"`` (a single token can end mid-character).
 """
 import json
+import os
 import re
 from collections import Counter
+from pathlib import Path
+from typing import Iterable, Protocol, runtime_checkable
 
 # Split into "leading whitespace + word" chunks (or a pure-whitespace run). Merges never
 # cross chunk boundaries — this is what GPT-2's regex pre-split buys, and it keeps a
 # leading space attached so " the" and "the" are distinct tokens.
 SPLIT_PATTERN = re.compile(r"\s*\S+|\s+")
+
+
+@runtime_checkable
+class Tokenizer(Protocol):
+    """What the rest of the codebase actually needs from a tokenizer.
+
+    Four members, derived by auditing every call site. Training is deliberately *not* here:
+    the two backends train from different shapes (one giant string vs an iterator), and a
+    two-branch ``if`` in one CLI command beats forcing them into a common signature.
+    """
+
+    def encode(self, text: str) -> list[int]: ...
+    def decode(self, tokens: list[int]) -> str: ...
+
+    @property
+    def n_vocab(self) -> int:
+        """The *actual* number of ids, i.e. what ``ModelConfig.vocab_size`` must equal."""
+
+    def sep_id(self, sep: str) -> int:
+        """The single id marking a document boundary, asserted to exist.
+
+        Lives on the backend because the two vocabularies are shaped differently and
+        neither derivation ports — see each implementation.
+        """
+
+
+def load_tokenizer(path) -> Tokenizer:
+    """Load whichever backend wrote ``path``, deciding from the file itself.
+
+    The two schemas are disjoint: this project's own format is exactly
+    ``{"vocab_size", "merges"}`` at the top level, while HuggingFace's has ``"model"``.
+    Sniffing rather than a config flag means the backend can never disagree with the file,
+    and ``--tokenizer PATH`` keeps selecting it with no extra CLI surface.
+    """
+    with open(path) as f:
+        head = json.load(f)
+    if "model" in head:
+        return HFTokenizer.load(path)
+    if "merges" in head and "vocab_size" in head:
+        return SimpleTokenizer.load(path)
+    raise ValueError(
+        f"{path} is not a tokenizer this project recognises: expected HuggingFace's "
+        f'{{"model": ...}} or SimpleTokenizer\'s {{"vocab_size", "merges"}}, '
+        f"got top-level keys {sorted(head)[:8]}")
 
 
 class SimpleTokenizer:
@@ -114,6 +169,32 @@ class SimpleTokenizer:
     def decode(self, tokens: list[int]) -> str:
         return b"".join(self.vocab[t] for t in tokens).decode("utf-8", errors="replace")
 
+    # ------------------------------------------------------------------ protocol
+    @property
+    def n_vocab(self) -> int:
+        """Actual id count. Distinct from ``vocab_size``, which is only a training target
+        and is what ``save`` writes — they coincide only if training ran to completion."""
+        return len(self.vocab)
+
+    def sep_id(self, sep: str) -> int:
+        """Id of the document-boundary token.
+
+        ``SPLIT_PATTERN`` peels the separator's trailing newline into its own chunk, so
+        ``encode(sep)`` returns two ids — but ``build_corpus`` writes ``sep + doc``
+        contiguously, so that newline is absorbed into the next word and ``ids[0]`` is the
+        lone boundary token in the corpus.
+
+        The assert catches the one failure that would ruin a run silently: if BPE never
+        learned the separator as a merge, ``ids[0]`` is a bare ``"\\n"``, every newline
+        reads as a document boundary, and training converges on a meaningless segmentation.
+        """
+        ids = self.encode(sep)
+        marker = sep.strip().encode()
+        assert marker in self.vocab[ids[0]], (
+            f"separator token {ids[0]} is {self.vocab[ids[0]]!r}, which does not carry "
+            f"{marker!r} — this tokenizer did not learn {sep!r} as one token")
+        return ids[0]
+
     # ------------------------------------------------------------------ persistence
     def save(self, path) -> None:
         with open(path, "w") as f:
@@ -132,3 +213,84 @@ class SimpleTokenizer:
             tok.merge_rules[(a, b)] = new_id
             tok.vocab[new_id] = tok.vocab[a] + tok.vocab[b]
         return tok
+
+
+class HFTokenizer:
+    """Byte-level BPE backed by HuggingFace ``tokenizers`` (rust).
+
+    Same algorithm as :class:`SimpleTokenizer`, orders of magnitude faster to train and to
+    encode. ``tokenizers`` is imported lazily inside the constructors so the from-scratch
+    fallback still works on a machine without the package.
+
+    The separator is a **declared special token**, not a merge BPE has to discover — the
+    single-id property that document masking depends on is guaranteed by construction.
+    """
+
+    def __init__(self, tk):
+        self._tk = tk
+
+    # ------------------------------------------------------------------ training
+    @classmethod
+    def train(cls, texts: Iterable[str], vocab_size: int, special: str) -> "HFTokenizer":
+        """Train from an iterable of documents (never materialized as one string)."""
+        from tokenizers import Tokenizer as _Tk
+        from tokenizers import decoders, models, pre_tokenizers, trainers
+
+        tk = _Tk(models.BPE(unk_token=None))                      # byte-level: no UNK case
+        # add_prefix_space=False: True would prepend a space to *every* encode() call, so
+        # generation's per-prompt encode would disagree with the corpus's per-chunk encode.
+        tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True)
+        tk.decoder = decoders.ByteLevel()
+        tk.train_from_iterator(texts, trainers.BpeTrainer(
+            vocab_size=vocab_size,
+            # On the *trainer*, so the special token is counted within vocab_size. Adding it
+            # afterwards would append id `vocab_size` and make n_vocab one too large.
+            special_tokens=[special],
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),  # all 256 bytes
+        ))
+        return cls(tk)
+
+    # ------------------------------------------------------------------ encode / decode
+    def encode(self, text: str) -> list[int]:
+        return self._tk.encode(text).ids
+
+    def decode(self, tokens: list[int]) -> str:
+        # skip_special_tokens defaults to True, which would delete the separator from
+        # generated text and silently turn main.py's boundary strip into a no-op.
+        return self._tk.decode(tokens, skip_special_tokens=False)
+
+    # ------------------------------------------------------------------ protocol
+    @property
+    def n_vocab(self) -> int:
+        return self._tk.get_vocab_size(with_added_tokens=True)
+
+    def sep_id(self, sep: str) -> int:
+        """Id of the document-boundary token — looked up directly, not inferred.
+
+        Unlike the from-scratch backend, ``encode(sep)`` here yields *three* ids
+        (``newline, separator, newline``) because ByteLevel keeps the newlines separate. So
+        ``ids[0]`` would be a bare newline: taking it would make every ``\\n`` a document
+        boundary. The special token is looked up by name instead.
+        """
+        marker = sep.strip()
+        tid = self._tk.token_to_id(marker)
+        assert tid is not None, (
+            f"{marker!r} is not a token in this tokenizer — it must be trained as a "
+            f"special token for document masking to work")
+        n = self.encode(sep).count(tid)
+        assert n == 1, f"{marker!r} encodes to {n} occurrences in {sep!r}, expected exactly 1"
+        return tid
+
+    # ------------------------------------------------------------------ persistence
+    def save(self, path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._tk.save(str(path))
+
+    @classmethod
+    def load(cls, path) -> "HFTokenizer":
+        from tokenizers import Tokenizer as _Tk
+
+        # Each corpus worker holds its own tokenizer; rust would otherwise spin up a rayon
+        # pool per process on top of the 8 already-forked workers.
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        return cls(_Tk.from_file(str(path)))

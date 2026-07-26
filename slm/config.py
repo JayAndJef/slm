@@ -12,6 +12,7 @@ rather than module globals (loose coupling):
 :func:`default_configs` is the single source of truth for the tiny "smoke" overrides.
 """
 import dataclasses
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from slm import paths
 class ModelConfig:
     """The five dimensions that define a JLM transformer's architecture."""
 
-    vocab_size: int = 4096
+    vocab_size: int = 32_000
     hidden_dim: int = 768
     num_heads: int = 12
     n_layer: int = 12
@@ -60,8 +61,9 @@ class TrainConfig:
     n_train_docs: int | None = None     # cap on training docs after mixing; None = all
     n_val_docs: int = 5_000
     seed: int = 42
-    sep: str = "\n<|endoftext|>\n"      # literal document separator (BPE learned it as one token)
+    sep: str = "\n<|endoftext|>\n"      # literal document separator (one token id in the corpus)
     n_workers: int = 8
+    tokens_per_byte: float | None = None  # measured from the corpus at setup; drives val_bpb
 
     # optimization
     batch_size: int = 160
@@ -93,14 +95,24 @@ class TrainConfig:
     wandb_project: str = "jlm"
 
     @property
+    def tokenizer_hash(self) -> str:
+        """Short digest of the tokenizer file, used to key the corpus caches.
+
+        A corpus is only meaningful under the tokenizer that produced it: swapping
+        tokenizers leaves every id in range, so nothing crashes, the loss curve looks
+        normal, and the token stream means nothing. Putting the digest in the filename
+        makes a changed tokenizer build a new cache instead of reusing the old ids.
+        """
+        return hashlib.sha256(Path(self.tokenizer_path).read_bytes()).hexdigest()[:8]
+
+    @property
     def train_path(self) -> Path:
-        """Cached train corpus. Named by ``tag`` + the doc cap, so changing the cap makes
-        a new file rather than silently reusing the old one."""
-        return self.data_dir / f"train_{self.tag}_{self.n_train_docs or 'all'}.npy"
+        """Cached train corpus, keyed by tag, doc cap, and tokenizer."""
+        return self.data_dir / f"train_{self.tag}_{self.n_train_docs or 'all'}_{self.tokenizer_hash}.npy"
 
     @property
     def val_path(self) -> Path:
-        return self.data_dir / f"val_{self.tag}_{self.n_val_docs}.npy"
+        return self.data_dir / f"val_{self.tag}_{self.n_val_docs}_{self.tokenizer_hash}.npy"
 
 
 def default_configs(smoke: bool = False) -> tuple[ModelConfig, TrainConfig]:
