@@ -98,11 +98,11 @@ class MultiheadSelfAttention(nn.Module):
     
 
 class SwiGLU(nn.Module):
-    def __init__(self, middle_size: int = 2048):
+    def __init__(self, hidden_size: int, middle_size: int = 2048):
         super().__init__()
-        self.w1 = nn.Linear(middle_size, middle_size)
-        self.w2 = nn.Linear(middle_size, middle_size)
-        self.w3 = nn.Linear(middle_size, middle_size)
+        self.w1 = nn.Linear(hidden_size, middle_size)
+        self.w2 = nn.Linear(hidden_size, middle_size)
+        self.w3 = nn.Linear(middle_size, hidden_size)
 
     def forward(self, x):
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
@@ -115,7 +115,7 @@ class TransformerBlock(nn.Module):
                  use_sdpa: bool = True):
         super().__init__()
         self.attn = MultiheadSelfAttention(hidden_dim, num_heads, block_size, use_sdpa)
-        self.ffn = SwiGLU(middle_size=2048)
+        self.ffn = SwiGLU(hidden_size=hidden_dim, middle_size=2048)
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.ln2 = nn.LayerNorm(hidden_dim)
 
