@@ -90,7 +90,7 @@ class TrainConfig:
     precision: str = "bf16-mixed"
     dataloader_workers: int = 2         # per-rank DataLoader workers (distinct from n_workers)
     wandb: bool = False
-    wandb_project: str = "slm"
+    wandb_project: str = "jlm"
 
     @property
     def train_path(self) -> Path:
