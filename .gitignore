@@ -1,0 +1,33 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Data & model artifacts (large, local-only). notebooks/tokenizer.json is kept (no *.json rule).
+data/
+*.npy
+checkpoints/
+*.pt
+*.log
+
+# Experiment tracking. WandbLogger writes run state to wandb/, and Lightning's default
+# ModelCheckpoint writes full checkpoints to <wandb_project>/<run_id>/checkpoints/ — so the
+# directory name follows --wandb-project and can't be listed exhaustively. *.ckpt catches
+# the large files wherever they land; the two below are the project names used so far.
+wandb/
+jlm/
+slm-test/
+lightning_logs/
+*.ckpt
+
+# Notebook scratch
+.ipynb_checkpoints/
+
+# Local tool settings
+.claude/settings.local.json
