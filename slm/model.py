@@ -195,6 +195,7 @@ class JLM(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
         self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)   # GPT-2's scale
 
     @classmethod
     def from_config(cls, cfg: ModelConfig) -> "JLM":
