@@ -41,7 +41,7 @@ def segment_block_mask(seg: torch.Tensor, compiled: bool = True) -> BlockMask:
 class RotaryPositionalEmbedding(nn.Module):
     """Rotary positional embedding."""
 
-    def __init__(self, head_dim: int = 64):
+    def __init__(self, head_dim: int):
         super().__init__()
         # Derived constant (not learned); persistent=False keeps it out of the state_dict.
         self.register_buffer("freqs", self._precompute_angles(head_dim), persistent=False)
@@ -59,7 +59,7 @@ class RotaryPositionalEmbedding(nn.Module):
         x_b_rot = x_a * sin + x_b * cos
         return torch.stack([x_a_rot, x_b_rot], dim=-1).reshape(B, H, T, D)
 
-    def _precompute_angles(self, head_dim: int = 64):
+    def _precompute_angles(self, head_dim: int):
         freqs = 1 / (10000 ** (torch.arange(0, head_dim, 2)/head_dim))
         return freqs
         
@@ -136,8 +136,19 @@ class MultiheadSelfAttention(nn.Module):
     
 
 class SwiGLU(nn.Module):
-    def __init__(self, hidden_size: int, middle_size: int = 2048):
+    """Gated FFN: ``w3(silu(w1 x) * w2 x)``.
+
+    ``middle_size`` defaults to ``8/3 * hidden_size`` rounded up to a multiple of 128 —
+    three matrices at 8/3 width hold the same parameter count as the two-matrix 4x GELU
+    MLP it replaces (``3 * d * 8d/3 == 8d^2``), so swapping FFNs is not secretly also a
+    model-size change. Derived rather than hardcoded: a fixed value silently changes the
+    ratio the moment ``hidden_dim`` moves.
+    """
+
+    def __init__(self, hidden_size: int, middle_size: int | None = None):
         super().__init__()
+        if middle_size is None:
+            middle_size = -(-(8 * hidden_size // 3) // 128) * 128   # ceil to a 128 multiple
         self.w1 = nn.Linear(hidden_size, middle_size)
         self.w2 = nn.Linear(hidden_size, middle_size)
         self.w3 = nn.Linear(middle_size, hidden_size)
@@ -153,7 +164,7 @@ class TransformerBlock(nn.Module):
                  use_sdpa: bool = True):
         super().__init__()
         self.attn = MultiheadSelfAttention(hidden_dim, num_heads, block_size, use_sdpa)
-        self.ffn = SwiGLU(hidden_size=hidden_dim, middle_size=2048)
+        self.ffn = SwiGLU(hidden_dim)   # width derived from hidden_dim, not pinned
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.ln2 = nn.LayerNorm(hidden_dim)
 
@@ -171,9 +182,8 @@ class JLM(nn.Module):
     next-token cross-entropy when ``targets`` is given, else ``None``.
     """
 
-    def __init__(self, vocab_size: int = 4096, hidden_dim: int = 768,
-                 num_heads: int = 12, n_layer: int = 12, block_size: int = 512,
-                 use_sdpa: bool = True):
+    def __init__(self, vocab_size: int, hidden_dim: int, num_heads: int, n_layer: int,
+                 block_size: int, use_sdpa: bool = True):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, hidden_dim)
         # ModuleList, not Sequential: blocks take a second (mask) argument, which
