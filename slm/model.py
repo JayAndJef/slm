@@ -95,6 +95,17 @@ class MultiheadSelfAttention(nn.Module):
         scores = F.softmax(scores, dim=-1)
         out = torch.einsum("bhqk,bhkd->bhqd", scores, v)
         return out
+    
+
+class SwiGLU(nn.Module):
+    def __init__(self, middle_size: int = 2048):
+        super().__init__()
+        self.w1 = nn.Linear(middle_size, middle_size)
+        self.w2 = nn.Linear(middle_size, middle_size)
+        self.w3 = nn.Linear(middle_size, middle_size)
+
+    def forward(self, x):
+        return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
 
 class TransformerBlock(nn.Module):
@@ -104,10 +115,7 @@ class TransformerBlock(nn.Module):
                  use_sdpa: bool = True):
         super().__init__()
         self.attn = MultiheadSelfAttention(hidden_dim, num_heads, block_size, use_sdpa)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4), nn.GELU(),
-            nn.Linear(hidden_dim * 4, hidden_dim),
-        )
+        self.ffn = SwiGLU(middle_size=2048)
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.ln2 = nn.LayerNorm(hidden_dim)
 
