@@ -7,9 +7,10 @@ past it, but to positions the model never saw during training.
 import torch
 import torch.nn.functional as F
 
-from slm import checkpoint
+from slm import checkpoint, paths
 from slm.config import SEP, ModelConfig
 from slm.model import JLM
+from slm.tokenizer import Tokenizer, load_tokenizer, load_tokenizer_json
 
 EOT = SEP                       # document boundary: the empty prompt, and the stop marker
 
@@ -25,6 +26,47 @@ def load_model(checkpoint_path, device) -> tuple[JLM, ModelConfig, dict]:
     model.load_state_dict(state)
     model.eval()
     return model, cfg, meta
+
+
+def tokenizer_for(meta: dict, cfg: ModelConfig, tokenizer_path=None) -> Tokenizer:
+    """The tokenizer a checkpoint was trained with, and the checks that it really is.
+
+    Resolution order: an explicit ``tokenizer_path`` (the override, for a checkpoint that
+    embeds none), then the copy embedded in the checkpoint, then the repo's current one.
+
+    Lives here rather than in a CLI command because *every* consumer needs it. Written
+    inline in ``generate`` it was inherited by nothing, and ``sft-eval`` scored the archived
+    v1 model against the v2 tokenizer — same ``vocab_size``, so the one check it did run
+    passed, and every id meant something else.
+    """
+    embedded = meta.get("tokenizer_json")
+    if tokenizer_path is not None:
+        tok = load_tokenizer(tokenizer_path)
+    elif embedded:
+        tok = load_tokenizer_json(embedded, source="tokenizer embedded in the checkpoint")
+    else:
+        tok = load_tokenizer(paths.TOKENIZER_PATH)
+
+    assert cfg.vocab_size == tok.n_vocab, (
+        f"checkpoint has vocab {cfg.vocab_size} but the tokenizer has {tok.n_vocab} — "
+        f"pass --tokenizer for the one this model was trained with")
+    recorded = meta.get("tokenizer_fingerprint")
+    assert recorded is None or recorded == tok.fingerprint, (
+        f"checkpoint was trained with tokenizer {recorded} but this one is "
+        f"{tok.fingerprint} — every id would mean something else")
+    if recorded is None:
+        print("warning: checkpoint records no tokenizer; cannot verify the pairing")
+    return tok
+
+
+def is_chat_checkpoint(meta: dict) -> bool:
+    """Whether the checkpoint's corpus was rendered as chat, i.e. whether to use ChatML.
+
+    ``False`` when the checkpoint records no corpus at all — which is what every checkpoint
+    written before :mod:`slm.train` started stamping one does, so an SFT model from before
+    then still needs an explicit ``--chat``.
+    """
+    return (meta.get("corpus") or {}).get("render_kind") == "chat"
 
 
 def top_p_filter(probs: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -46,16 +88,18 @@ def top_p_filter(probs: torch.Tensor, top_p: float) -> torch.Tensor:
 @torch.no_grad()
 def stream(model, tokenizer, *, prompt: str = EOT,
            max_new_tokens: int = 250, temperature: float = 0.8,
-           top_p: float = 0.9, block_size: int, device):
+           top_p: float = 0.9, block_size: int, device, stop_id: int | None = None):
     """Autoregressively sample ``max_new_tokens`` tokens continuing ``prompt``, yielding
-    the continuation as it arrives. Stops early when the model emits :data:`EOT`: it has
-    ended its document, and the corpus trains it to start an unrelated one straight after.
+    the continuation as it arrives. Stops early on ``stop_id``, which defaults to the
+    document separator: the model has ended its document, and the corpus trains it to start
+    an unrelated one straight after. A chat model stops on ``<|im_end|>`` instead.
 
     ``top_p >= 1.0`` disables nucleus filtering (sample from the full distribution).
     Temperature is applied first: it changes the probabilities, so it also changes which
     tokens fall inside the nucleus.
     """
-    stop_id = tokenizer.sep_id(EOT)
+    if stop_id is None:
+        stop_id = tokenizer.sep_id(EOT)
     ids = torch.tensor([tokenizer.encode(prompt)], device=device)
     pending = []
 

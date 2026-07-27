@@ -1,25 +1,123 @@
-"""Typed configuration for the model architecture and a training run.
+"""Typed configuration: what a corpus *is*, and how a run is tuned.
 
-Two dataclasses keep the knobs in one place and make functions depend on plain data
-rather than module globals (loose coupling):
+Two kinds of dataclass, and the distinction is load-bearing:
 
-- :class:`ModelConfig` — the five architecture dimensions. Its fields are exactly the
-  keys stored in a checkpoint's ``config`` dict, so a saved model round-trips through
-  :meth:`ModelConfig.from_dict` / :meth:`ModelConfig.to_dict`.
-- :class:`TrainConfig` — everything about a training run (data, optimization, eval,
-  checkpointing, runtime).
+- A **Spec** describes an artifact's identity. :class:`SourceSpec` says which documents
+  exist, :class:`RenderSpec` how they become tokens, :class:`CorpusSpec` pairs them. Their
+  fields are digested into a corpus filename, so changing one produces a *different corpus*
+  rather than a silently different run.
+- A **Config** holds run knobs. :class:`ModelConfig` is the five architecture dimensions
+  (exactly the keys a checkpoint stores); :class:`TrainConfig` is optimization, eval and
+  runtime. Neither is ever hashed — two runs at different learning rates read the same
+  corpus, and should.
 
-:func:`default_configs` is the single source of truth for the tiny "smoke" overrides.
+:func:`default_configs` is the single source of truth for the "smoke" overrides, and
+:data:`CORPUS_PRESETS` for the corpora themselves.
 """
 import dataclasses
-import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from slm import paths
+from slm.chat import EOT
 
-SEP = "\n<|endoftext|>\n"       # document separator; one token id in the corpus
+SEP = f"\n{EOT}\n"              # document separator; one token id in the corpus
 
+
+# ---------------------------------------------------------------- specs (hashed)
+
+@dataclass(frozen=True)
+class SourcePart:
+    """One ``(config, split)`` slice of a dataset, with an optional row cap."""
+
+    config: str | None                  # HF config/subset name; None if unpartitioned
+    split: str = "train"                # HF split — NOT Corpus's train/val split
+    cap: int | None = None
+
+
+@dataclass
+class SourceSpec:
+    """Which documents exist, and how they divide into train and val.
+
+    ``parts`` is a flat list rather than a ``{config: cap}`` mapping plus one split name,
+    because datasets disagree about which axis carries the structure: cosmopedia is 7
+    configs each with a ``train`` split, while smoltalk2 is one ``SFT`` config with 25
+    splits. A list of ``(config, split, cap)`` expresses both without a special case.
+
+    It is always an **explicit** list, never a pattern. A glob is stable in the file while
+    the set it matches is not: an upstream split appearing would change the corpus with no
+    change to its hash — the exact drift this module exists to make visible. Write the list
+    with ``main.py list-splits``.
+    """
+
+    dataset_name: str
+    parts: tuple[SourcePart, ...]
+    columns: tuple[str, ...] = ("text",)
+    n_train_docs: int | None = None     # cap on training docs after mixing; None = all
+    n_val_docs: int = 5_000
+    seed: int = 42                      # shuffles the document pool
+
+    def hash_fields(self) -> tuple:
+        """Everything that changes *which documents* are present, in a stable order.
+
+        The doc counts are excluded because the corpus filename already carries them, so a
+        changed cap renames the file without pretending to be a different recipe.
+        """
+        return (self.dataset_name, tuple(dataclasses.astuple(p) for p in self.parts),
+                tuple(self.columns), self.seed)
+
+
+@dataclass
+class RenderSpec:
+    """How a source record becomes tokens.
+
+    Every field that can change the token stream is hashed; the ones that cannot are
+    excluded and say so. ``mask_partial_head`` is the interesting exclusion — it is applied
+    when a window is *read*, not when the corpus is written, so it changes which tokens
+    count rather than which tokens exist.
+    """
+
+    kind: str = "pretrain"              # "pretrain" | "chat"
+    sep: str = SEP
+    text_column: str = "text"
+    messages_column: str = "messages"
+    max_example_tokens: int | None = None   # chat: drop/truncate examples longer than this
+    pack: str = "flat"                  # "flat" | "bfd"
+    pack_block: int | None = None       # bin size for bfd; must equal the model's block_size
+    mask_partial_head: bool = True      # read-time only -> NOT hashed
+
+    def hash_fields(self) -> tuple:
+        """Only the fields live for this ``kind``.
+
+        Hashing all of them would make changing ``messages_column`` on a pretrain corpus, or
+        ``max_example_tokens`` on a pretrain corpus, re-encode a stream that did not change.
+        """
+        common = (self.kind, self.sep, self.pack, self.pack_block)
+        if self.kind == "pretrain":
+            return common + (self.text_column,)
+        if self.kind == "chat":
+            return common + (self.messages_column, self.max_example_tokens)
+        raise ValueError(
+            f"RenderSpec.kind must be 'pretrain' or 'chat', got {self.kind!r}")
+
+
+@dataclass
+class CorpusSpec:
+    """A corpus's identity: where its documents come from, and how they are rendered.
+
+    Deliberately carries no paths. ``tokenizer_path`` / ``data_dir`` / ``hf_cache_dir`` are
+    *locations*, not identity — they say where to look, not what is there — and folding them
+    in would bake machine-local absolute paths into the record that is supposed to describe
+    the corpus. They are arguments to :func:`slm.corpus.build` instead.
+    """
+
+    source: SourceSpec
+    render: RenderSpec
+    name: str = ""                      # set by corpus_preset from its key; names the cache files
+
+
+# ---------------------------------------------------------------- configs (never hashed)
 
 @dataclass
 class ModelConfig:
@@ -48,26 +146,7 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    """Settings for one training run: data source, optimization, eval, runtime."""
-
-    # data
-    dataset_name: str = "HuggingFaceTB/cosmopedia"
-    dataset_mix: dict[str, int | None] = field(default_factory=lambda: {
-        "auto_math_text": None,         # 1.95M rows
-        "stanford": None,               # 1.02M
-        "stories": 1_800_000,           # of 4.99M
-        "web_samples_v2": 1_800_000,    # of 10.3M
-        "wikihow": None,                # 179k
-        "openstax": None,               # 126k
-        "khanacademy": None,            # 24k
-    })
-    n_train_docs: int | None = None     # cap on training docs after mixing; None = all
-    n_val_docs: int = 5_000
-    seed: int = 42
-    sampler_seed: int | None = None     # window order only; None = follow `seed`
-    sep: str = SEP
-    n_workers: int = 16
-    tokens_per_byte: float | None = None  # measured from the corpus at setup; drives val_bpb
+    """Settings for one training run: optimization, eval, runtime, and where things live."""
 
     # optimization
     batch_size: int = 48
@@ -80,90 +159,138 @@ class TrainConfig:
     grad_clip: float = 1.0
     compile: bool = True                # torch.compile the model (CUDA only)
     doc_mask: bool = True               # stop attention crossing document boundaries
+    sampler_seed: int | None = None     # window order only; None = follow the source seed
 
     # eval / checkpoint
-    eval_every: int = 1000               # -> Trainer val_check_interval (steps)
+    eval_every: int = 1000              # -> Trainer val_check_interval (steps)
     eval_iters: int = 18                # -> Trainer limit_val_batches
-    tag: str = "cosmo"                  # names the cached corpus files
-    init_from: Path | None = None       # compact checkpoint whose weights start this run
+    init_from: Path | None = None       # checkpoint whose *weights* start this run
+    resume_from: Path | None = None     # Lightning ckpt to resume exactly (momentum, schedule)
     out_dir: Path = field(default_factory=lambda: paths.CKPT_DIR)
+
+    # locations (not identity — see CorpusSpec)
     data_dir: Path = field(default_factory=lambda: paths.DATA_DIR)
     tokenizer_path: Path = field(default_factory=lambda: paths.TOKENIZER_PATH)
     hf_cache_dir: str = paths.HF_CACHE_DIR
 
     # Lightning / distributed runtime
     accelerator: str = "auto"           # "auto" | "cuda" | "cpu"
-    devices: str = "1"                  # GPU count (e.g. "1", "2"), or comma-list of indices ("0,1")
+    devices: str = "1"                  # GPU count (e.g. "1", "2"), or comma-list ("0,1")
     num_nodes: int = 1
     precision: str = "bf16-mixed"
-    dataloader_workers: int = 2         # per-rank DataLoader workers (distinct from n_workers)
+    dataloader_workers: int = 2         # per-rank DataLoader workers
     wandb: bool = False
     wandb_project: str = "jlm"
 
-    @property
-    def corpus_hash(self) -> str:
-        """Short digest of everything that determines the token stream.
 
-        Every input here fails *silently* when it drifts. A changed tokenizer leaves all
-        ids in range, so nothing crashes, the loss curve looks normal, and the stream means
-        nothing. A changed ``dataset_mix`` or ``seed`` reshuffles the pool, which moves the
-        val split — losses stop being comparable with no signal at all. A changed ``sep``
-        changes the boundary token the document mask keys off.
+def window_seed(train_cfg: TrainConfig, source: SourceSpec) -> int:
+    """Seed for the *window order only*, deliberately outside the corpus hash.
 
-        Folding them into the filename turns each of those into a visible re-encode instead
-        of a wrong run. ``n_workers`` is deliberately absent: it permutes the order shards
-        are concatenated in, but not which documents are present, and windows are shuffled
-        anyway.
-        """
-        key = repr((sorted(self.dataset_mix.items()), self.seed, self.sep, self.dataset_name))
-        return hashlib.sha256(
-            Path(self.tokenizer_path).read_bytes() + key.encode()).hexdigest()[:8]
+    ``SourceSpec.seed`` shuffles the document pool, so changing it changes which documents
+    exist and which are held out — hence its place in the hash, and hence a re-encode when
+    it moves. "Serve the same corpus in a different order" is a separate question, and a
+    continuation run needs exactly that: without it the second run replays the window order
+    the first one already trained on.
 
-    @property
-    def window_seed(self) -> int:
-        """Seed for the *window order only*, deliberately outside :attr:`corpus_hash`.
-
-        ``seed`` shuffles the document pool, so changing it changes which documents exist
-        and which are held out — hence its place in the hash, and hence a re-encode when it
-        moves. "Serve the same corpus in a different order" is a separate question, and a
-        continuation run needs exactly that: without it the second run replays the window
-        order the first one already trained on.
-        """
-        return self.seed if self.sampler_seed is None else self.sampler_seed
-
-    @property
-    def train_path(self) -> Path:
-        """Cached train corpus: tag, both doc counts, and :attr:`corpus_hash`. Train is
-        ``pool[n_val_docs:][:n_train_docs]``, so ``n_val_docs`` moves it too."""
-        return self.data_dir / (
-            f"train_{self.tag}_{self.n_val_docs}"
-            f"+{'all' if self.n_train_docs is None else self.n_train_docs}"
-            f"_{self.corpus_hash}.npy")
-
-    @property
-    def val_path(self) -> Path:
-        return self.data_dir / f"val_{self.tag}_{self.n_val_docs}_{self.corpus_hash}.npy"
+    A function rather than a property because the two seeds now live on different objects;
+    keeping the explanation in one place is worth the call.
+    """
+    return source.seed if train_cfg.sampler_seed is None else train_cfg.sampler_seed
 
 
-def default_configs(smoke: bool = False) -> tuple[ModelConfig, TrainConfig]:
-    """Return the (model, train) config pair for a real run, or a tiny smoke run.
+# ---------------------------------------------------------------- presets
 
-    Smoke mode shrinks every dimension for a fast end-to-end sanity check, disables
+_COSMOPEDIA_MIX = (                     # order is hashed: keep it stable
+    SourcePart("auto_math_text"),       # 1.95M rows
+    SourcePart("stanford"),             # 1.02M
+    SourcePart("stories", cap=1_800_000),        # of 4.99M
+    SourcePart("web_samples_v2", cap=1_800_000),  # of 10.3M
+    SourcePart("wikihow"),              # 179k
+    SourcePart("openstax"),             # 126k
+    SourcePart("khanacademy"),          # 24k
+)
+
+# smoltalk2 SFT, the non-thinking splits minus multilingual, tool-calling and 64k-context.
+# See CLAUDE.md for the row counts and why each of the four is out.
+_SMOLTALK2_NOTHINK = (
+    "OpenThoughts3_1.2M_no_think_no_think",
+    "smoltalk_smollm3_smol_magpie_ultra_no_think",
+    "OpenHermes_2.5_no_think",
+    "smoltalk_smollm3_smol_summarize_no_think",
+    "Mixture_of_Thoughts_science_no_think",
+    "smoltalk_smollm3_smol_rewrite_no_think",
+    "smoltalk_smollm3_systemchats_30k_no_think",
+    "smoltalk_smollm3_explore_instruct_rewriting_no_think",
+    "tulu_3_sft_personas_instruction_following_no_think",
+    "table_gpt_no_think",
+    "smoltalk_smollm3_everyday_conversations_no_think",
+)
+
+
+def _cosmopedia() -> CorpusSpec:
+    return CorpusSpec(
+        source=SourceSpec("HuggingFaceTB/cosmopedia", _COSMOPEDIA_MIX),
+        render=RenderSpec(kind="pretrain"),
+    )
+
+
+def _smoltalk2(block_size: int = 1024) -> CorpusSpec:
+    return CorpusSpec(
+        source=SourceSpec(
+            "HuggingFaceTB/smoltalk2",
+            tuple(SourcePart("SFT", s) for s in _SMOLTALK2_NOTHINK),
+            columns=("messages",), n_val_docs=2_000),
+        render=RenderSpec(kind="chat", max_example_tokens=block_size,
+                          pack="bfd", pack_block=block_size),
+    )
+
+
+def _smoke() -> CorpusSpec:
+    return CorpusSpec(
+        source=SourceSpec("HuggingFaceTB/cosmopedia", (SourcePart("khanacademy"),),
+                          n_train_docs=2_000, n_val_docs=200),
+        render=RenderSpec(kind="pretrain"),
+    )
+
+
+CORPUS_PRESETS: dict[str, Callable[[], CorpusSpec]] = {
+    "cosmopedia": _cosmopedia,
+    "smoltalk2": _smoltalk2,
+    "smoke": _smoke,
+}
+
+
+def corpus_preset(name: str) -> CorpusSpec:
+    """Look up a preset by name, listing the alternatives when it misses.
+
+    Stamps the key onto the spec, so ``--corpus X`` and the cache filename cannot disagree.
+    Letting each factory name itself is two strings that are always meant to match, and the
+    failure is a filename that quietly describes a different corpus than the flag that built
+    it.
+    """
+    if name not in CORPUS_PRESETS:
+        raise ValueError(
+            f"unknown corpus {name!r} — expected one of {sorted(CORPUS_PRESETS)}")
+    spec = CORPUS_PRESETS[name]()
+    spec.name = name
+    return spec
+
+
+def default_configs(smoke: bool = False) -> tuple[ModelConfig, TrainConfig, CorpusSpec]:
+    """Return the (model, train, corpus) triple for a real run, or a tiny smoke run.
+
+    Smoke shrinks every dimension for a fast end-to-end sanity check, disables
     ``torch.compile`` (compile warmup would dwarf 60 steps), and routes checkpoints to
-    ``checkpoints/smoke/`` so a real ``best.pt`` is never touched.
+    ``checkpoints/smoke/`` so a real run's output is never touched.
     """
     if not smoke:
-        return ModelConfig(), TrainConfig()
+        return ModelConfig(), TrainConfig(), corpus_preset("cosmopedia")
 
     model = ModelConfig(hidden_dim=128, num_heads=4, n_layer=4, block_size=128)
     train = TrainConfig(
-        # One tiny config (24k rows, 46 MB) — a capped load still downloads whole HF
-        # configs, so smoke must narrow the mix, not just the doc count.
-        dataset_mix={"khanacademy": None},
-        n_train_docs=2_000, n_val_docs=200,
         batch_size=16, max_steps=60, warmup_steps=10,
         eval_every=20, eval_iters=10,
-        compile=False, tag="smoke", out_dir=paths.CKPT_DIR / "smoke",
+        compile=False, out_dir=paths.CKPT_DIR / "smoke",
         dataloader_workers=0,
     )
-    return model, train
+    return model, train, corpus_preset("smoke")

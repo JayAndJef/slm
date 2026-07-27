@@ -10,6 +10,8 @@ every import. ``data/`` is gitignored *except* for ``*.json``, since a checkpoin
 unusable without the tokenizer that produced its ids.
 """
 import os
+import sys
+import warnings
 from pathlib import Path
 
 PACKAGE_DIR = Path(__file__).resolve().parent          # .../slm/slm
@@ -24,8 +26,12 @@ CKPT_DIR = REPO_ROOT / "checkpoints"                   # model checkpoints (*.pt
 # TrainConfig.hf_cache_dir. Deferring to a pre-set HF_HOME keeps those two in agreement.
 HF_CACHE_DIR = os.environ.get("HF_HOME", "/data/zejiaqi/huggingface-cache")
 
-# Must be set BEFORE huggingface_hub is imported: it resolves HF_HOME into module
-# constants at import time, so assigning it later (e.g. inside load_docs) silently has no
-# effect and multi-GB downloads land in ~/.cache on the home filesystem instead. This
-# module is imported before any HF package, which is the only reason it can be fixed here.
 os.environ.setdefault("HF_HOME", HF_CACHE_DIR)
+os.environ.setdefault("HF_HUB_CACHE", str(Path(HF_CACHE_DIR) / "hub"))
+os.environ.setdefault("HF_XET_CACHE", str(Path(HF_CACHE_DIR) / "xet"))
+
+if "huggingface_hub" in sys.modules:            # too late to matter — say so
+    warnings.warn(
+        f"huggingface_hub was imported before slm.paths, so it resolved its cache from the "
+        f"environment and not {HF_CACHE_DIR} — downloads will land in ~/.cache. Import slm "
+        f"(or slm.paths) first.", RuntimeWarning, stacklevel=2)

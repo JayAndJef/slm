@@ -24,6 +24,7 @@ Design:
   order training created them in. ``decode`` concatenates the byte expansions and
   decodes once with ``errors="replace"`` (a single token can end mid-character).
 """
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,20 @@ from typing import Iterable, Protocol
 from tokenizers import Tokenizer as _RustTokenizer
 from tokenizers import decoders, models, pre_tokenizers, trainers
 
+from slm import chat      # leaf module: the special block. No cycle, no torch, no datasets.
+
+
+def _digest(n_reserved: int, named: list[tuple[str, int | None]], body) -> str:
+    """8-hex digest of an id <-> bytes mapping, hashed incrementally.
+
+    Streamed rather than ``repr``'d in one go: ``body`` is ~32k entries, and building that
+    string only to hash it costs megabytes for no benefit.
+    """
+    h = hashlib.sha256(repr((n_reserved, sorted(named))).encode())
+    for i, tok in body:
+        h.update(repr((i, tok)).encode())
+    return h.hexdigest()[:8]
+
 # Split into "leading whitespace + word" chunks (or a pure-whitespace run). Merges never
 # cross chunk boundaries — this is what GPT-2's regex pre-split buys, and it keeps a
 # leading space attached so " the" and "the" are distinct tokens.
@@ -45,7 +60,7 @@ SPLIT_PATTERN = re.compile(r"\s*\S+|\s+")
 class Tokenizer(Protocol):
     """What the rest of the codebase actually needs from a tokenizer.
 
-    Four members, derived by auditing every call site. Training is deliberately *not* here:
+    Six members, derived by auditing every call site. Training is deliberately *not* here:
     the two backends train from different shapes (one giant string vs an iterator), and a
     two-branch ``if`` in one CLI command beats forcing them into a common signature.
     """
@@ -57,11 +72,33 @@ class Tokenizer(Protocol):
     def n_vocab(self) -> int:
         """The *actual* number of ids, i.e. what ``ModelConfig.vocab_size`` must equal."""
 
+    @property
+    def fingerprint(self) -> str:
+        """Short digest of the id <-> bytes mapping: what an id *means*, and nothing else.
+
+        Not a digest of the file. Renaming an unclaimed ``<|reserved_k|>`` slot changes the
+        file but cannot change any id assignment for text that does not contain that literal
+        — and a reserved slot exists precisely to be renamed. Hashing the file would turn
+        every such rename into a corpus re-encode, i.e. into exactly the cost the reserved
+        block was meant to buy off.
+
+        So reserved ids are excluded **by id range**, never by matching the name. The name
+        filter is self-defeating: renaming ``<|reserved_7|>`` makes it stop matching, so it
+        enters the digest and the hash moves anyway.
+        """
+
     def sep_id(self, sep: str) -> int:
         """The single id marking a document boundary, asserted to exist.
 
         Lives on the backend because the two vocabularies are shaped differently and
         neither derivation ports — see each implementation.
+        """
+
+    def special_id(self, token: str) -> int:
+        """The id of one declared special token, asserted to be exactly one id.
+
+        Distinct from :meth:`sep_id`, which takes the newline-wrapped separator *string* and
+        must strip it. This takes the bare marker.
         """
 
 
@@ -73,14 +110,26 @@ def load_tokenizer(path) -> Tokenizer:
     Sniffing rather than a config flag means the backend can never disagree with the file,
     and ``--tokenizer PATH`` keeps selecting it with no extra CLI surface.
     """
-    with open(path) as f:
-        head = json.load(f)
+    return load_tokenizer_json(Path(path).read_text(), source=str(path))
+
+
+def load_tokenizer_json(data: str | bytes, source: str = "<tokenizer json>") -> Tokenizer:
+    """The same sniff, from the JSON itself rather than from a path.
+
+    What the compact checkpoint format embeds is the tokenizer's *bytes*, and this is how
+    they are read. Materialising them to a file first needs a name unique to the process:
+    a shared one (``checkpoints/.embedded-tokenizer.json``) lets two ``generate`` runs on
+    different checkpoints overwrite each other's vocabulary between the write and the read,
+    or read a half-written file — ``write_bytes`` is not atomic.
+    """
+    text = data.decode() if isinstance(data, bytes) else data
+    head = json.loads(text)
     if "model" in head:
-        return HFTokenizer.load(path)
+        return HFTokenizer.from_json(text)
     if "merges" in head and "vocab_size" in head:
-        return SimpleTokenizer.load(path)
+        return SimpleTokenizer.from_json(head)
     raise ValueError(
-        f"{path} is not a tokenizer this project recognises: expected HuggingFace's "
+        f"{source} is not a tokenizer this project recognises: expected HuggingFace's "
         f'{{"model": ...}} or SimpleTokenizer\'s {{"vocab_size", "merges"}}, '
         f"got top-level keys {sorted(head)[:8]}")
 
@@ -180,13 +229,34 @@ class SimpleTokenizer:
         and is what ``save`` writes — they coincide only if training ran to completion."""
         return len(self.vocab)
 
+    def special_id(self, token: str) -> int:
+        """Id of a marker BPE happened to *learn*, since this backend declares nothing.
+
+        Implemented rather than raised so the protocol has no member one backend can never
+        satisfy. It succeeds for a marker frequent enough to become a merge and fails for
+        one that never appeared — which is the honest outcome, and is how a chat corpus
+        discovers it needs the HF backend.
+        """
+        ids = self.encode(token)
+        assert len(ids) == 1 and token.encode() in self.vocab[ids[0]], (
+            f"{token!r} encodes to {len(ids)} ids in this SimpleTokenizer, not 1 — it was "
+            f"never learned as a merge. Declared special tokens need the HF backend; "
+            f"re-run train-tokenizer with --backend hf")
+        return ids[0]
+
+    @property
+    def fingerprint(self) -> str:
+        """Digest of the whole vocabulary — this backend declares no reserved block, so
+        there is no range to exclude."""
+        return _digest(0, [], sorted(self.vocab.items()))
+
     def sep_id(self, sep: str) -> int:
         """Id of the document-boundary token.
 
         ``SPLIT_PATTERN`` peels the separator's trailing newline into its own chunk, so
-        ``encode(sep)`` returns two ids — but ``build_corpus`` writes ``sep + doc``
-        contiguously, so that newline is absorbed into the next word and ``ids[0]`` is the
-        lone boundary token in the corpus.
+        ``encode(sep)`` returns two ids — but :class:`slm.render.PretrainRenderer` writes
+        ``sep + doc`` contiguously, so that newline is absorbed into the next word and
+        ``ids[0]`` is the lone boundary token in the corpus.
 
         The assert catches the one failure that would ruin a run silently: if BPE never
         learned the separator as a merge, ``ids[0]`` is a bare ``"\\n"``, every newline
@@ -212,7 +282,10 @@ class SimpleTokenizer:
     @classmethod
     def load(cls, path) -> "SimpleTokenizer":
         with open(path) as f:
-            data = json.load(f)
+            return cls.from_json(json.load(f))
+
+    @classmethod
+    def from_json(cls, data: dict) -> "SimpleTokenizer":
         tok = cls(vocab_size=data["vocab_size"])
         for a, b, new_id in sorted(data["merges"], key=lambda m: m[2]):
             tok.merge_rules[(a, b)] = new_id
@@ -235,8 +308,14 @@ class HFTokenizer:
 
     # ------------------------------------------------------------------ training
     @classmethod
-    def train(cls, texts: Iterable[str], vocab_size: int, special: str) -> "HFTokenizer":
-        """Train from an iterable of documents (never materialized as one string)."""
+    def train(cls, texts: Iterable[str], vocab_size: int,
+              specials: list[str]) -> "HFTokenizer":
+        """Train from an iterable of documents (never materialized as one string).
+
+        ``specials`` is the whole reserved block (see :func:`slm.chat.specials`), not just
+        the separator: declaring the unused slots now is what makes a future marker a rename
+        instead of a re-encode.
+        """
         tk = _RustTokenizer(models.BPE(unk_token=None))                      # byte-level: no UNK case
         # add_prefix_space=False: True would prepend a space to *every* encode() call, so
         # generation's per-prompt encode would disagree with the corpus's per-chunk encode.
@@ -244,9 +323,9 @@ class HFTokenizer:
         tk.decoder = decoders.ByteLevel()
         tk.train_from_iterator(texts, trainers.BpeTrainer(
             vocab_size=vocab_size,
-            # On the *trainer*, so the special token is counted within vocab_size. Adding it
-            # afterwards would append id `vocab_size` and make n_vocab one too large.
-            special_tokens=[special],
+            # On the *trainer*, so the specials are counted within vocab_size. Adding them
+            # afterwards would append ids past it and make n_vocab too large.
+            special_tokens=list(specials),
             initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),  # all 256 bytes
         ))
         return cls(tk)
@@ -265,22 +344,47 @@ class HFTokenizer:
     def n_vocab(self) -> int:
         return self._tk.get_vocab_size(with_added_tokens=True)
 
+    def special_id(self, token: str) -> int:
+        tid = self._tk.token_to_id(token)
+        assert tid is not None, (
+            f"{token!r} is not a token in this tokenizer — it must be declared on the "
+            f"BpeTrainer at training time; re-run train-tokenizer")
+        return tid
+
     def sep_id(self, sep: str) -> int:
-        """Id of the document-boundary token — looked up directly, not inferred.
+        """Id of the document-boundary token — looked up by name, not inferred.
 
         Unlike the from-scratch backend, ``encode(sep)`` here yields *three* ids
         (``newline, separator, newline``) because ByteLevel keeps the newlines separate. So
         ``ids[0]`` would be a bare newline: taking it would make every ``\\n`` a document
-        boundary. The special token is looked up by name instead.
+        boundary.
         """
         marker = sep.strip()
-        tid = self._tk.token_to_id(marker)
-        assert tid is not None, (
-            f"{marker!r} is not a token in this tokenizer — it must be trained as a "
-            f"special token for document masking to work")
+        tid = self.special_id(marker)
         n = self.encode(sep).count(tid)
         assert n == 1, f"{marker!r} encodes to {n} occurrences in {sep!r}, expected exactly 1"
         return tid
+
+    @property
+    def n_reserved(self) -> int:
+        """Size of the declared special block, recovered from the file.
+
+        The specials were declared on the trainer, so they are recorded as added tokens and
+        occupy the lowest ids. Asserting they are exactly ``0..n-1`` is what lets
+        :attr:`fingerprint` exclude them as a *range*.
+        """
+        ids = sorted(self._tk.get_added_tokens_decoder())
+        assert ids == list(range(len(ids))), (
+            f"declared specials occupy ids {ids}, not a contiguous block from 0 — the "
+            f"fingerprint's reserved range assumes they do; re-run train-tokenizer")
+        return len(ids)
+
+    @property
+    def fingerprint(self) -> str:
+        return _digest(self.n_reserved,
+                       [(n, self._tk.token_to_id(n)) for n in chat.NAMED_SPECIALS],
+                       sorted((i, t) for t, i in self._tk.get_vocab().items()
+                              if i >= self.n_reserved))
 
     # ------------------------------------------------------------------ persistence
     def save(self, path) -> None:
@@ -293,3 +397,9 @@ class HFTokenizer:
         # pool per process on top of the 8 already-forked workers.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         return cls(_RustTokenizer.from_file(str(path)))
+
+    @classmethod
+    def from_json(cls, text: str) -> "HFTokenizer":
+        """Build from the file's contents — see :func:`load_tokenizer_json`."""
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        return cls(_RustTokenizer.from_str(text))
