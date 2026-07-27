@@ -29,11 +29,16 @@ SEP = f"\n{EOT}\n"              # document separator; one token id in the corpus
 
 @dataclass(frozen=True)
 class SourcePart:
-    """One ``(config, split)`` slice of a dataset, with an optional row cap."""
+    """One ``(config, split)`` slice of a dataset, with an optional row cap.
+
+    ``shards`` names the data files to fetch and is the only thing that bounds the download —
+    ``cap`` bounds only what is kept, after the whole config has already been pulled.
+    """
 
     config: str | None                  # HF config/subset name; None if unpartitioned
     split: str = "train"                # HF split — NOT Corpus's train/val split
-    cap: int | None = None
+    cap: int | None = None              # rows kept after loading; does NOT bound the download
+    shards: tuple[str, ...] | None = None   # explicit data files, relative to the repo root
 
 
 @dataclass
@@ -200,6 +205,31 @@ def window_seed(train_cfg: TrainConfig, source: SourceSpec) -> int:
 
 # ---------------------------------------------------------------- presets
 
+def _shards(config: str, n: int, total: int) -> tuple[str, ...]:
+    """The first ``n`` of a config's ``total`` parquet shards, as explicit filenames.
+
+    Generated rather than typed out, but still fully specified: ``total`` is baked into each
+    name, so if the repo is ever re-sharded the paths stop resolving and the build fails
+    loudly. That is the property a glob would lose — it would silently match the new set and
+    change the corpus under an unchanged hash.
+    """
+    return tuple(f"{config}/train-{i:05d}-of-{total:05d}.parquet" for i in range(n))
+
+
+# SmolLM-Corpus. Measured with the v2 tokenizer: cosmopedia-v2 is 376,289 docs/shard at 728
+# tok/doc (0.27B/shard, 28.5B over all 104); fineweb-edu-dedup is 812,684 docs/shard at 1,168
+# tok/doc (0.95B/shard, 222.0B over all 234). ~70/30 fineweb/cosmopedia by tokens, which is
+# roughly SmolLM2's own recipe: real filtered web text for breadth, synthetic textbook prose
+# for the clean explanatory register a small model needs to read coherently.
+#
+# `python-edu` is deliberately absent. Its rows carry only blob_id/repo_name/path — the source
+# itself lives in Software Heritage's S3 and needs a separate fetch (measured at 380 blobs/s
+# over 64 threads, so ~5.6 h for all 7.68M). See `fetch-python-edu` if it is ever added.
+_SMOLLM_MIX = (
+    SourcePart("fineweb-edu-dedup", shards=_shards("fineweb-edu-dedup", 22, 234)),  # ~20.9B
+    SourcePart("cosmopedia-v2", shards=_shards("cosmopedia-v2", 33, 104)),          # ~8.9B
+)
+
 _COSMOPEDIA_MIX = (                     # order is hashed: keep it stable
     SourcePart("auto_math_text"),       # 1.95M rows
     SourcePart("stanford"),             # 1.02M
@@ -227,6 +257,13 @@ _SMOLTALK2_NOTHINK = (
 )
 
 
+def _smollm() -> CorpusSpec:
+    return CorpusSpec(
+        source=SourceSpec("HuggingFaceTB/smollm-corpus", _SMOLLM_MIX),
+        render=RenderSpec(kind="pretrain"),
+    )
+
+
 def _cosmopedia() -> CorpusSpec:
     return CorpusSpec(
         source=SourceSpec("HuggingFaceTB/cosmopedia", _COSMOPEDIA_MIX),
@@ -246,14 +283,19 @@ def _smoltalk2(block_size: int = 1024) -> CorpusSpec:
 
 
 def _smoke() -> CorpusSpec:
+    # One shard of the real corpus, capped to a few thousand docs. Points at the same files
+    # the pretrain preset uses, so smoke costs no download of its own once that is built.
     return CorpusSpec(
-        source=SourceSpec("HuggingFaceTB/cosmopedia", (SourcePart("khanacademy"),),
-                          n_train_docs=2_000, n_val_docs=200),
+        source=SourceSpec(
+            "HuggingFaceTB/smollm-corpus",
+            (SourcePart("cosmopedia-v2", shards=_shards("cosmopedia-v2", 1, 104)),),
+            n_train_docs=2_000, n_val_docs=200),
         render=RenderSpec(kind="pretrain"),
     )
 
 
 CORPUS_PRESETS: dict[str, Callable[[], CorpusSpec]] = {
+    "smollm": _smollm,
     "cosmopedia": _cosmopedia,
     "smoltalk2": _smoltalk2,
     "smoke": _smoke,

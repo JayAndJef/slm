@@ -200,8 +200,13 @@ def load_docs(spec: SourceSpec, *, hf_cache_dir: str) -> tuple[Dataset, Dataset]
     # HF_HOME is set in slm.paths, before huggingface_hub is imported — see the note there.
     parts = []
     for p in spec.parts:
-        ds = load_dataset(spec.dataset_name, name=p.config, split=p.split,
-                          cache_dir=hf_cache_dir)
+        if p.shards:
+            ds = load_dataset("parquet", data_files={
+                "train": [f"hf://datasets/{spec.dataset_name}/{s}" for s in p.shards]},
+                split="train", cache_dir=hf_cache_dir)
+        else:
+            ds = load_dataset(spec.dataset_name, name=p.config, split=p.split,
+                              cache_dir=hf_cache_dir)
         ds = ds.select_columns(list(spec.columns)).shuffle(seed=spec.seed)
         if p.cap is not None:
             ds = ds.select(range(min(p.cap, len(ds))))   # random sample, not file order
