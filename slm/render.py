@@ -76,6 +76,60 @@ class Rendered(NamedTuple):
         """
         return len(self.ids) - self.n_pad
 
+    def doc_starts(self, sep_id: int | None) -> np.ndarray:
+        """Index of the first token of each document, from ``is_start`` or the separator."""
+        if self.is_start is not None:
+            return np.flatnonzero(self.is_start)
+        assert sep_id is not None, "need is_start or a sep_id to find document boundaries"
+        return np.flatnonzero(self.ids == sep_id)
+
+    def sort_by_length(self, *, sep_id: int | None = None) -> "Rendered":
+        """Reorder whole documents shortest-first, so a length band is a contiguous window
+        range the loader can bias toward at read time. A permutation: nothing is added or lost.
+        """
+        starts = self.doc_starts(sep_id)
+        if len(starts) == 0:
+            return self
+        lengths = np.diff(starts, append=len(self.ids))
+        order = np.argsort(lengths, kind="stable")
+
+        # sep is [newline, EOT, newline], so index 0 is a bare newline: keep it as a prefix.
+        take = lambda a: None if a is None else np.concatenate(
+            [a[:starts[0]]] + [a[starts[i]:starts[i] + lengths[i]] for i in order])
+        return self._replace(ids=take(self.ids), is_target=take(self.is_target),
+                             is_start=take(self.is_start))
+
+    def length_index(self, *, sep_id: int | None = None, n_quantiles: int = 128) -> list:
+        """``[min_tokens, token_offset, doc_offset]`` triples into a length-sorted stream.
+
+        Token offsets, not window indices, because ``block_size`` is a read-time parameter.
+        The ladder pins the thresholds anyone actually types, where the equal-token-mass
+        quantiles are sparsest; ``doc_offset`` makes a region's mean length recoverable.
+        """
+        starts = self.doc_starts(sep_id)
+        if len(starts) == 0:
+            return []
+        lengths = np.diff(starts, append=len(self.ids))
+        srt = np.sort(lengths, kind="stable")
+        # + starts[0]: the sorted stream keeps the pre-first-boundary prefix at its head.
+        offsets = int(starts[0]) + np.concatenate([[0], np.cumsum(srt)])
+
+        LADDER = (256, 512, 1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768)
+        marks = set(LADDER)
+        marks.update(int(srt[min(len(srt) - 1, int(len(srt) * q / n_quantiles))])
+                     for q in range(n_quantiles + 1))
+        # Geometric marks to the max: doc-count quantiles all land in the bulk, leaving the
+        # tail represented by one document that a high request would then snap onto alone.
+        m = float(LADDER[-1])
+        while m < srt[-1]:
+            m *= 2 ** 0.5
+            marks.add(int(min(m, srt[-1])))
+        out = []
+        for t in sorted(marks):
+            i = int(np.searchsorted(srt, t, side="left"))        # first doc with length >= t
+            out.append([int(t), int(offsets[i]), i])
+        return out
+
     def pack_bfd(self, block: int, *, pad_id: int) -> "Rendered":
         """Re-order whole examples into ``block``-sized bins, first-fit-decreasing.
 

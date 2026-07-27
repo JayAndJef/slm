@@ -4,6 +4,11 @@ Thin driver — the model/step/optimizer logic lives in :mod:`slm.lit`. This ass
 logger and callbacks, parses the device spec, and calls ``trainer.fit``. Multi-GPU is
 data-parallel (DDP): pass ``devices`` as a count or a comma-list of PyTorch device indices.
 """
+import hashlib
+import subprocess
+import uuid
+from datetime import datetime
+
 import lightning as L
 import torch
 from lightning.pytorch.callbacks import ModelCheckpoint, RichProgressBar
@@ -13,6 +18,8 @@ from slm import checkpoint
 from slm.config import ModelConfig, TrainConfig
 from slm.lit import LitJLM, SLMDataModule
 from slm.tokenizer import load_tokenizer
+
+_SAFE_OVERRIDES = ("block_size", "rope_theta")
 
 
 def parse_devices(spec: str):
@@ -35,14 +42,67 @@ def n_devices(spec: str) -> int:
     return torch.cuda.device_count() if devices < 0 else max(1, devices)
 
 
-def _make_logger(cfg: TrainConfig):
+def _make_logger(cfg: TrainConfig, run_id: str):
+    """Pass the run id through, so a restart appends to that run instead of forking a new one."""
     if cfg.wandb:
-        return WandbLogger(project=cfg.wandb_project)
+        return WandbLogger(project=cfg.wandb_project, name=f"{cfg.out_dir.name}-{run_id}",
+                           id=run_id, resume="allow")
     return CSVLogger(save_dir=str(cfg.out_dir), name="logs")
 
 
+def _git_stamp() -> str:
+    """``git describe``, plus a digest of the uncommitted diff — a bare sha claims this code
+    produced these weights, which is false whenever anything is uncommitted."""
+    try:
+        out = subprocess.run(["git", "describe", "--always", "--dirty"], capture_output=True,
+                             text=True, timeout=5, check=True).stdout.strip()
+        if out.endswith("-dirty"):
+            diff = subprocess.run(["git", "diff", "HEAD"], capture_output=True,
+                                  timeout=5, check=True).stdout
+            out += "+" + hashlib.sha256(diff).hexdigest()[:8]
+        return out
+    except Exception:
+        return "unknown"
+
+
+def _run_record(train_cfg, model_cfg, spec, corpus_hash, tokens_per_byte, fingerprint,
+                world_size, run_id, command) -> dict:
+    """This run's entry in the checkpoint history: config, provenance, empty results."""
+    effective_batch = train_cfg.batch_size * world_size
+    return {
+        "run_id": run_id,
+        "command": command,
+        "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        **train_cfg.to_record(),
+        **model_cfg.to_dict(),
+        "corpus": {"name": spec.name, "hash": corpus_hash, "render_kind": spec.render.kind},
+        "tokenizer_fingerprint": fingerprint,
+        "tokens_per_byte": tokens_per_byte,
+        "world_size": world_size,
+        "effective_batch": effective_batch,
+        "tokens_per_update": effective_batch * model_cfg.block_size,
+        "git": _git_stamp(),
+        "updates": None, "val_loss": None, "val_bpb": None,
+        "tokens_seen": 0, "tokens_seen_total": None, "wall_s": None,
+    }
+
+
+def _parent_history(meta: dict) -> list:
+    """A parent checkpoint's run chain, synthesizing one entry for files written before
+    history existed so the chain is never silently empty."""
+    if meta.get("history"):
+        return list(meta["history"])
+    if not (meta.get("corpus") or meta.get("tokenizer_fingerprint")):
+        return []
+    return [{"command": "unknown", "backfilled": True, "corpus": meta.get("corpus"),
+             "tokenizer_fingerprint": meta.get("tokenizer_fingerprint"),
+             "tokens_per_byte": meta.get("tokens_per_byte"),
+             "updates": meta.get("step"), "val_loss": meta.get("val")}]
+
+
 def train(model_cfg: ModelConfig | None, train_cfg: TrainConfig,
-          spec, train_corpus, val_corpus):
+          spec, train_corpus, val_corpus, model_overrides: dict | None = None,
+          command: str | None = None):
     """Fit a model with Lightning; returns the path to the compact best checkpoint.
 
     With ``train_cfg.init_from`` set, the run starts from that checkpoint's **weights** —
@@ -60,20 +120,35 @@ def train(model_cfg: ModelConfig | None, train_cfg: TrainConfig,
     lets any consumer refuse a tokenizer the weights were not trained against; both are
     silent failures otherwise, and neither is recoverable from the weights.
     """
-    init_state = None
+    init_state, history = None, []
     if train_cfg.init_from is not None:
         init_state, model_cfg, meta = checkpoint.load(train_cfg.init_from)
+        history = _parent_history(meta)
         val_str = "n/a" if meta["val"] is None else f"{meta['val']:.4f}"
         print(f"continuing from {train_cfg.init_from} "
               f"(step {meta['step']}, val {val_str}) — weights only")
     assert model_cfg is not None, "pass a ModelConfig, or set train_cfg.init_from"
 
+    for field, value in (model_overrides or {}).items():
+        assert field in _SAFE_OVERRIDES, (
+            f"cannot override {field!r} on a continuation — only {_SAFE_OVERRIDES} leave "
+            f"the parameter shapes alone, anything else fails load_state_dict(strict=True)")
+        print(f"{field}: {getattr(model_cfg, field)} -> {value}")
+        setattr(model_cfg, field, value)
+
     # The vocab/tokenizer asserts live on the corpus now (SLMDataModule.setup), where they
     # check the stream the model will actually read rather than a tokenizer file beside it.
     torch.set_float32_matmul_precision("high")   # use Tensor Cores for fp32 matmuls
     devices = parse_devices(train_cfg.devices)
-    n_ranks = len(devices) if isinstance(devices, list) else devices
-    strategy = "ddp" if n_ranks and n_ranks > 1 else "auto"
+    n_ranks = n_devices(train_cfg.devices)
+    strategy = "ddp" if n_ranks > 1 else "auto"
+
+    # Before the logger: a resume must reuse the run id or W&B forks a new run.
+    resumed_history = []
+    if train_cfg.resume_from is not None:
+        resumed_history = _parent_history(checkpoint.load(train_cfg.resume_from)[2])
+    prior = resumed_history[-1] if resumed_history else {}
+    run_id = prior.get("run_id") or uuid.uuid4().hex[:8]
 
     trainer = L.Trainer(
         accelerator=train_cfg.accelerator,
@@ -99,14 +174,28 @@ def train(model_cfg: ModelConfig | None, train_cfg: TrainConfig,
                             auto_insert_metric_name=False),
             RichProgressBar(),
         ],
-        logger=_make_logger(train_cfg),
+        logger=_make_logger(train_cfg, run_id),
     )
     dm = SLMDataModule(train_cfg, model_cfg, spec, train_corpus, val_corpus)
+    fingerprint = load_tokenizer(train_cfg.tokenizer_path).fingerprint
+    record = _run_record(train_cfg, model_cfg, spec, train_corpus.hash, dm.tokens_per_byte,
+                         fingerprint, n_ranks * train_cfg.num_nodes, run_id,
+                         command or ("continue-train" if train_cfg.init_from else "train"))
+
+    if train_cfg.resume_from is not None:
+        # Replaces the last record. The new one wins outright; only identity carries over.
+        record.update(command=prior.get("command") or record["command"],
+                      init_from=record["init_from"] or prior.get("init_from"),
+                      resumed=prior.get("resumed", 0) + 1)
+        history = resumed_history[:-1] + [record]
+    else:
+        history = history + [record]
+
     provenance = {
-        "corpus": {"name": spec.name, "hash": train_corpus.hash,
-                   "render_kind": spec.render.kind},
-        "tokenizer_fingerprint": load_tokenizer(train_cfg.tokenizer_path).fingerprint,
+        "corpus": record["corpus"],
+        "tokenizer_fingerprint": fingerprint,
         "tokens_per_byte": dm.tokens_per_byte,      # val_bpb = val_loss * this / ln 2
+        "history": history,
     }
     lit = LitJLM(model_cfg, train_cfg, init_state=init_state,
                  tokens_per_byte=dm.tokens_per_byte, provenance=provenance)

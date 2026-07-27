@@ -54,6 +54,14 @@ _TRAINING_OPTIONS = [
     click.option("--warmup-steps", type=int, default=None),
     click.option("--decay-frac", type=float, default=None,
                  help="Trailing fraction of max_steps spent decaying (1.0 = pure anneal)."),
+    click.option("--long-min-tokens", type=int, default=None,
+                 help="Oversample documents at least this long. Needs a pack='sorted' "
+                      "corpus; pair with --long-frac."),
+    click.option("--long-max-tokens", type=int, default=None,
+                 help="Upper bound of that band. Longer documents still train at their "
+                      "natural rate — this only stops oversampling them."),
+    click.option("--long-frac", type=float, default=None,
+                 help="Share of windows drawn from the band (e.g. 0.4)."),
     click.option("--sampler-seed", type=int, default=None,
                  help="Reshuffles the window order without renaming the corpus cache."),
     click.option("--eval-every", type=int, default=None, help="Steps between validations."),
@@ -130,8 +138,9 @@ def _require_corpus(spec, train_cfg, *, smoke: bool):
 @click.option("--num-heads", type=int, default=None)
 @click.option("--n-layer", type=int, default=None)
 @click.option("--block-size", type=int, default=None)
+@click.option("--rope-theta", type=float, default=None, help="RoPE base frequency.")
 def train(smoke, corpus_name, out_dir, vocab_size, hidden_dim, num_heads, n_layer,
-          block_size, **opts):
+          block_size, rope_theta, **opts):
     """Train a model from scratch with Lightning (or a tiny --smoke run)."""
     if out_dir is None and not smoke:
         raise click.UsageError(
@@ -141,8 +150,8 @@ def train(smoke, corpus_name, out_dir, vocab_size, hidden_dim, num_heads, n_laye
     model_cfg, train_cfg, spec = default_configs(smoke=smoke)
     if corpus_name:
         spec = corpus_preset(corpus_name)
-    _apply(model_cfg, vocab_size=vocab_size, hidden_dim=hidden_dim,
-           num_heads=num_heads, n_layer=n_layer, block_size=block_size)
+    _apply(model_cfg, vocab_size=vocab_size, hidden_dim=hidden_dim, num_heads=num_heads,
+           n_layer=n_layer, block_size=block_size, rope_theta=rope_theta)
     _apply(train_cfg, out_dir=out_dir, **opts)
     run_train(model_cfg, train_cfg, spec, *_require_corpus(spec, train_cfg, smoke=smoke))
 
@@ -156,13 +165,18 @@ def train(smoke, corpus_name, out_dir, vocab_size, hidden_dim, num_heads, n_laye
 @click.option("--corpus", "corpus_name", default=None,
               help=f"Corpus preset: {', '.join(sorted(CORPUS_PRESETS))}.")
 @training_options
-def continue_train(init_from, out_dir, corpus_name, **opts):
+@click.option("--block-size", type=int, default=None,
+              help="Context length to continue at. Changes no parameter shape, so the "
+                   "weights still load; pair with --rope-theta when extending.")
+@click.option("--rope-theta", type=float, default=None,
+              help="RoPE base frequency. Raise it with --block-size (e.g. 500000 at 8192).")
+def continue_train(init_from, out_dir, corpus_name, block_size, rope_theta, **opts):
     """Continue training from a checkpoint's weights under a fresh LR schedule.
 
     Weights only — the compact format carries no optimizer moments, scheduler position or
     dataloader offset, so momentum rebuilds over the first few hundred steps. The
-    architecture is read from the checkpoint; model-dimension flags would be meaningless
-    here and are deliberately absent.
+    architecture is read from the checkpoint, except ``--block-size``/``--rope-theta``:
+    those size no parameter, so a context extension can change them and still load strict.
 
     Defaults describe a **pure anneal**: no warmup, no stable phase, decay straight from
     ``--lr`` to ``--min-lr`` across ``--max-steps``. That is what a fully-decayed model
@@ -176,8 +190,10 @@ def continue_train(init_from, out_dir, corpus_name, **opts):
     train_cfg.max_steps, train_cfg.warmup_steps = 4_000, 0
     train_cfg.lr, train_cfg.min_lr, train_cfg.decay_frac = 1e-4, 0.0, 1.0
     _apply(train_cfg, **opts)
-    # architecture comes from the checkpoint
-    run_train(None, train_cfg, spec, *_require_corpus(spec, train_cfg, smoke=False))
+    overrides = {k: v for k, v in
+                 (("block_size", block_size), ("rope_theta", rope_theta)) if v is not None}
+    run_train(None, train_cfg, spec, *_require_corpus(spec, train_cfg, smoke=False),
+              model_overrides=overrides)
 
 
 @cli.command()
@@ -227,7 +243,7 @@ def sft(init_from, out_dir, corpus_name, epochs, **opts):
         train_cfg.max_steps = max(1, round(train_corpus.meta["n_tokens"] * epochs / per_step))
         click.echo(f"{epochs} epochs over {train_corpus.meta['n_tokens']/1e6:.0f}M tokens "
                    f"= {train_cfg.max_steps} steps at {per_step:,} tokens/step")
-    run_train(None, train_cfg, spec, train_corpus, val_corpus)
+    run_train(None, train_cfg, spec, train_corpus, val_corpus, command="sft")
 
 
 @cli.command("sft-eval")
@@ -486,11 +502,93 @@ def export(ckpt, out_path, tokenizer_path):
                f"({Path(out_path).stat().st_size/1e6:.1f} MB, tokenizer {tok.fingerprint})")
 
 
+@cli.command("sort-corpus")
+@click.option("--corpus", "corpus_name", required=True,
+              help="Preset naming the FLAT source corpus, e.g. smollm.")
+@click.option("--into", "dest_name", required=True,
+              help="Preset naming the sorted destination, e.g. smollm-sorted.")
+@click.option("--split", type=click.Choice(["train", "val", "both"]), default="both",
+              show_default=True)
+def sort_corpus(corpus_name, dest_name, split):
+    """Reorder an encoded corpus shortest-document-first, without re-encoding.
+
+    Only the order changes, so re-encoding 28B tokens to permute them would cost ~100 min
+    for what this reproduces in ~10, and the permutation is asserted rather than trusted.
+    """
+    cfg = TrainConfig()
+    src_spec, dst_spec = corpus_preset(corpus_name), corpus_preset(dest_name)
+    assert dst_spec.render.pack == "sorted", (
+        f"--into must name a pack='sorted' preset; {dest_name} is {dst_spec.render.pack!r}")
+    src_pair = corpus.locate(src_spec, data_dir=cfg.data_dir, tokenizer_path=cfg.tokenizer_path)
+    dst_pair = corpus.locate(dst_spec, data_dir=cfg.data_dir, tokenizer_path=cfg.tokenizer_path)
+    wanted = {"train": [0], "val": [1], "both": [0, 1]}[split]
+
+    for i in wanted:
+        src, dst = src_pair[i], dst_pair[i]
+        if not src.exists():
+            raise click.UsageError(f"source corpus not built: {src.name}")
+        click.echo(f"{src.name} -> {dst.name}")
+        corpus.sort_corpus(src, dst, logger=lambda m: click.echo(f"  {m}"))
+
+
+def _fmt_n(n) -> str:
+    """Token counts as B/M, so a column of them is comparable at a glance."""
+    if not n:
+        return "-"
+    for scale, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if n >= scale:
+            return f"{n/scale:.2f}{suffix}"
+    return str(int(n))
+
+
+def _echo_history(history: list) -> None:
+    """One row per run behind these weights, oldest first.
+
+    ``batch`` is per_rank x world_size: TrainConfig.batch_size alone is per rank, and the
+    product is what actually sets the optimization dynamics.
+    """
+    if not history:
+        return
+    total = max((r.get("tokens_seen_total") or 0) for r in history)
+    # A backfilled record predates token accounting, so the total is a floor, not a sum.
+    partial = ">" if any(r.get("tokens_seen") is None for r in history) else ""
+    click.echo(f"\n  training history ({len(history)} run{'s' * (len(history) != 1)}, "
+               f"{partial}{_fmt_n(total)} tokens)")
+    click.echo("   " + " ".join([f"{'#':>2}", f"{'command':<14}", f"{'corpus':<22}",
+                                 f"{'ctx':>5}", f"{'theta':>7}", f"{'batch':>7}",
+                                 f"{'updates':>9}", f"{'lr':>8}", f"{'->min':>8}",
+                                 f"{'tokens':>8}", f"{'val':>7}", f"{'val_bpb':>8}"]))
+    for i, r in enumerate(history, 1):
+        c = r.get("corpus") or {}
+        corpus = f"{c.get('name', '?')} {(c.get('hash') or '')[:8]}".strip()
+        theta = r.get("rope_theta")
+        batch = (f"{r['batch_size']}x{r['world_size']}"
+                 if r.get("batch_size") and r.get("world_size") else "-")
+        val, bpb, lr, min_lr = (r.get("val_loss"), r.get("val_bpb"),
+                                r.get("lr"), r.get("min_lr"))
+        cells = [f"{i:>2}", f"{r.get('command', '?'):<14}", f"{corpus:<22}",
+                 f"{r.get('block_size') or '-':>5}",
+                 f"{(f'{theta/1000:g}k' if theta else '-'):>7}", f"{batch:>7}",
+                 f"{(r.get('updates') or 0):>9,}",
+                 f"{(f'{lr:.1e}' if lr else '-'):>8}",
+                 f"{(f'{min_lr:.1e}' if min_lr is not None else '-'):>8}",
+                 f"{_fmt_n(r.get('tokens_seen')):>8}",
+                 f"{(f'{val:.4f}' if val else '-'):>7}",
+                 f"{(f'{bpb:.5f}' if bpb else '-'):>8}"]
+        click.echo("   " + " ".join(cells)
+                   + ("  (backfilled)" if r.get("backfilled") else "")
+                   + (f"  (resumed x{r['resumed']})" if r.get("resumed") else ""))
+
+
 @cli.command()
 @click.argument("ckpt", type=click.Path(exists=True))
-def inspect(ckpt):
-    """Print what a checkpoint is: architecture, provenance, and where it came from."""
+@click.option("--json", "as_json", is_flag=True, help="Dump the raw history records.")
+def inspect(ckpt, as_json):
+    """Print what a checkpoint is: architecture, provenance, and every run behind it."""
     _, model_cfg, meta = checkpoint.load(ckpt)
+    if as_json:
+        click.echo(json.dumps(meta.get("history") or [], indent=2, default=str))
+        return
     val, tpb = meta.get("val"), meta.get("tokens_per_byte")
     # val_bpb is derived, never stored: it is val_loss rescaled by the corpus's tokens/byte,
     # which is the only form comparable across vocab sizes.
@@ -505,9 +603,7 @@ def inspect(ckpt):
     corpus_meta = meta.get("corpus") or {}
     click.echo(f"  corpus      {corpus_meta.get('name', 'unknown')} "
                f"{corpus_meta.get('hash', '')}")
-    for node in meta.get("lineage") or []:
-        click.echo(f"    <- {node.get('run_id', '?')} step {node.get('step')} "
-                   f"val {node.get('val')}")
+    _echo_history(meta.get("history") or [])
 
 
 @cli.command("train-tokenizer")

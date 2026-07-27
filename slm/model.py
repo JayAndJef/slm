@@ -39,10 +39,12 @@ def segment_block_mask(seg: torch.Tensor, compiled: bool = True) -> BlockMask:
 
 
 class RotaryPositionalEmbedding(nn.Module):
-    """Rotary positional embedding."""
+    """Rotary positional embedding. Raising ``theta`` trades short-range resolution for the
+    long-range distinguishability a longer context needs."""
 
-    def __init__(self, head_dim: int):
+    def __init__(self, head_dim: int, theta: float = 10_000.0):
         super().__init__()
+        self.theta = theta
         # Derived constant (not learned); persistent=False keeps it out of the state_dict.
         self.register_buffer("freqs", self._precompute_angles(head_dim), persistent=False)
 
@@ -60,7 +62,7 @@ class RotaryPositionalEmbedding(nn.Module):
         return torch.stack([x_a_rot, x_b_rot], dim=-1).reshape(B, H, T, D)
 
     def _precompute_angles(self, head_dim: int):
-        freqs = 1 / (10000 ** (torch.arange(0, head_dim, 2)/head_dim))
+        freqs = 1 / (self.theta ** (torch.arange(0, head_dim, 2)/head_dim))
         return freqs
         
 
@@ -71,7 +73,7 @@ class MultiheadSelfAttention(nn.Module):
     Projects the input to per-head queries/keys/values, RMS-normalizes q and k
     (QK-norm — bounds the attention logits so they cannot grow without limit, which is
     what lets the learning rate go up), computes scaled dot-product scores, masks out
-    future positions (lower-triangular ``tril`` buffer), softmaxes, and mixes the values.
+    future positions, softmaxes, and mixes the values.
     A final projection lets the heads exchange information.
 
     QK-norm leaves ``self.scale`` alone: normalized q and k give ``q·k`` an RMS of about
@@ -88,20 +90,20 @@ class MultiheadSelfAttention(nn.Module):
     """
 
     def __init__(self, hidden_dim: int, num_heads: int, block_size: int,
-                 use_sdpa: bool = True):
+                 use_sdpa: bool = True, rope_theta: float = 10_000.0):
+        # block_size is unused now — kept so the three constructors keep one shape.
         super().__init__()
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
         self.k_proj = nn.Linear(hidden_dim, hidden_dim)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
         self.num_heads = num_heads
         head_dim = hidden_dim // num_heads
         self.scale = head_dim ** 0.5
         self.q_norm = nn.RMSNorm(head_dim)
         self.k_norm = nn.RMSNorm(head_dim)
-        self.rope = RotaryPositionalEmbedding(head_dim)
+        self.rope = RotaryPositionalEmbedding(head_dim, rope_theta)
         self.use_sdpa = use_sdpa
 
     def forward(self, x, block_mask=None):
@@ -135,10 +137,14 @@ class MultiheadSelfAttention(nn.Module):
 
     def _attend_manual(self, q, k, v):
         """The longhand version: score -> causal mask -> softmax -> mix values.
+
+        The mask is built per call; as a persistent buffer it put ``block_size`` in the
+        state_dict, which blocks continuing a run at a longer context.
         """
         scores = torch.einsum("bhid,bhjd->bhij", q, k) / self.scale
         T = scores.size(-1)
-        scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # ty:ignore[not-subscriptable]
+        causal = torch.ones(T, T, device=scores.device, dtype=torch.bool).tril()
+        scores = scores.masked_fill(~causal, float("-inf"))
         scores = F.softmax(scores, dim=-1)
         out = torch.einsum("bhqk,bhkd->bhqd", scores, v)
         return out
@@ -170,9 +176,10 @@ class TransformerBlock(nn.Module):
     """Pre-norm transformer block: x + attn(ln1(x)), then x + ffn(ln2(x))."""
 
     def __init__(self, hidden_dim: int, num_heads: int, block_size: int,
-                 use_sdpa: bool = True):
+                 use_sdpa: bool = True, rope_theta: float = 10_000.0):
         super().__init__()
-        self.attn = MultiheadSelfAttention(hidden_dim, num_heads, block_size, use_sdpa)
+        self.attn = MultiheadSelfAttention(hidden_dim, num_heads, block_size, use_sdpa,
+                                           rope_theta)
         self.ffn = SwiGLU(hidden_dim)   # width derived from hidden_dim, not pinned
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.ln2 = nn.LayerNorm(hidden_dim)
@@ -192,13 +199,13 @@ class JLM(nn.Module):
     """
 
     def __init__(self, vocab_size: int, hidden_dim: int, num_heads: int, n_layer: int,
-                 block_size: int, use_sdpa: bool = True):
+                 block_size: int, use_sdpa: bool = True, rope_theta: float = 10_000.0):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, hidden_dim)
         # ModuleList, not Sequential: blocks take a second (mask) argument, which
         # Sequential cannot forward. State_dict keys ``blocks.N.*`` are unchanged.
         self.blocks = nn.ModuleList([
-            TransformerBlock(hidden_dim, num_heads, block_size, use_sdpa)
+            TransformerBlock(hidden_dim, num_heads, block_size, use_sdpa, rope_theta)
             for _ in range(n_layer)
         ])
         self.norm = nn.LayerNorm(hidden_dim)
@@ -208,7 +215,8 @@ class JLM(nn.Module):
 
     @classmethod
     def from_config(cls, cfg: ModelConfig) -> "JLM":
-        return cls(cfg.vocab_size, cfg.hidden_dim, cfg.num_heads, cfg.n_layer, cfg.block_size)
+        return cls(cfg.vocab_size, cfg.hidden_dim, cfg.num_heads, cfg.n_layer,
+                   cfg.block_size, rope_theta=cfg.rope_theta)
 
     def forward(self, x, targets=None, block_mask=None):
         """``block_mask`` defaults to ``None`` -> plain causal attention, which is what

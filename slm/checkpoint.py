@@ -45,6 +45,12 @@ def _strip(key: str) -> str:
     return key
 
 
+def _drop_stale(state: dict) -> dict:
+    """Drop buffers the model no longer registers — ``tril`` is in every older checkpoint
+    and would fail ``strict=True``; it was a derived constant, so nothing is lost."""
+    return {k: v for k, v in state.items() if not k.endswith(".tril")}
+
+
 def _lightning_val(ck: dict) -> float | None:
     """The monitored value at the step a Lightning checkpoint was written, if recorded.
 
@@ -139,7 +145,7 @@ def load(path, map_location="cpu") -> tuple[dict, ModelConfig, dict]:
         ck = torch.load(path, map_location=map_location, weights_only=False)
 
     if "state_dict" in ck:                                  # Lightning
-        state = {_strip(k): v for k, v in ck["state_dict"].items()}
+        state = _drop_stale({_strip(k): v for k, v in ck["state_dict"].items()})
         hp = dict(ck.get("hyper_parameters") or {})
         # hparams first: they carry the run's provenance (corpus, tokenizer), but must not
         # be able to overwrite what this file itself says its step and format are.
@@ -162,4 +168,4 @@ def load(path, map_location="cpu") -> tuple[dict, ModelConfig, dict]:
     assert tuple(derived) == DERIVED_META, "DERIVED_META must name exactly these keys"
     meta = json.loads(ck.get("meta_json") or "{}")
     meta.update(derived)
-    return ck["model"], ModelConfig.from_dict(ck["config"]), meta
+    return _drop_stale(ck["model"]), ModelConfig.from_dict(ck["config"]), meta

@@ -88,7 +88,7 @@ class RenderSpec:
     text_column: str = "text"
     messages_column: str = "messages"
     max_example_tokens: int | None = None   # chat: drop/truncate examples longer than this
-    pack: str = "flat"                  # "flat" | "bfd"
+    pack: str = "flat"                  # "flat" | "sorted" | "bfd"
     pack_block: int | None = None       # bin size for bfd; must equal the model's block_size
     mask_partial_head: bool = True      # read-time only -> NOT hashed
 
@@ -133,6 +133,7 @@ class ModelConfig:
     num_heads: int = 16
     n_layer: int = 12
     block_size: int = 1024
+    rope_theta: float = 10_000.0        # RoPE base; raise it when extending context
 
     @classmethod
     def from_dict(cls, d: dict) -> "ModelConfig":
@@ -166,6 +167,11 @@ class TrainConfig:
     doc_mask: bool = True               # stop attention crossing document boundaries
     sampler_seed: int | None = None     # window order only; None = follow the source seed
 
+    # Length-band oversampling; needs a pack="sorted" corpus. All read-time, never hashed.
+    long_min_tokens: int | None = None  # lower bound of the oversampled band
+    long_max_tokens: int | None = None  # optional upper: docs above it keep their natural rate
+    long_frac: float = 0.0              # share of served windows drawn from the band
+
     # eval / checkpoint
     eval_every: int = 1000              # -> Trainer val_check_interval (steps)
     eval_iters: int = 18                # -> Trainer limit_val_batches
@@ -186,6 +192,26 @@ class TrainConfig:
     dataloader_workers: int = 2         # per-rank DataLoader workers
     wandb: bool = False
     wandb_project: str = "jlm"
+
+    def to_record(self) -> dict:
+        """Every knob that could change the result, JSON-ready, for the checkpoint history.
+
+        Derived from the fields rather than a whitelist, so a new knob cannot be forgotten.
+        Locations are excluded: they are machine-local, not part of what produced the
+        weights. ``init_from`` stays — a stale parent path still beats none.
+        """
+        out = {}
+        for f in dataclasses.fields(self):
+            if f.name in _RECORD_EXCLUDED:
+                continue
+            v = getattr(self, f.name)
+            out[f.name] = str(v) if isinstance(v, Path) else v
+        return out
+
+
+# Machine-local, so not part of what produced the weights.
+_RECORD_EXCLUDED = frozenset({"out_dir", "data_dir", "tokenizer_path", "hf_cache_dir",
+                              "resume_from"})
 
 
 def window_seed(train_cfg: TrainConfig, source: SourceSpec) -> int:
@@ -264,6 +290,15 @@ def _smollm() -> CorpusSpec:
     )
 
 
+def _smollm_sorted() -> CorpusSpec:
+    """``smollm`` ordered shortest-first — same tokens, and identical under uniform sampling;
+    derive it with ``sort-corpus`` rather than re-encoding."""
+    return CorpusSpec(
+        source=SourceSpec("HuggingFaceTB/smollm-corpus", _SMOLLM_MIX),
+        render=RenderSpec(kind="pretrain", pack="sorted"),
+    )
+
+
 def _cosmopedia() -> CorpusSpec:
     return CorpusSpec(
         source=SourceSpec("HuggingFaceTB/cosmopedia", _COSMOPEDIA_MIX),
@@ -294,11 +329,20 @@ def _smoke() -> CorpusSpec:
     )
 
 
+def _smoke_sorted() -> CorpusSpec:
+    """``smoke`` ordered shortest-first — the cheap end-to-end test of band sampling."""
+    spec = _smoke()
+    return CorpusSpec(source=spec.source,
+                      render=RenderSpec(kind="pretrain", pack="sorted"))
+
+
 CORPUS_PRESETS: dict[str, Callable[[], CorpusSpec]] = {
     "smollm": _smollm,
+    "smollm-sorted": _smollm_sorted,
     "cosmopedia": _cosmopedia,
     "smoltalk2": _smoltalk2,
     "smoke": _smoke,
+    "smoke-sorted": _smoke_sorted,
 }
 
 

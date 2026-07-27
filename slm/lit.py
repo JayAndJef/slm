@@ -89,7 +89,8 @@ class LitJLM(L.LightningModule):
     project chooses, and :func:`slm.checkpoint.load` turns it into ``meta``. Without it a
     fine-tuned model is indistinguishable from a base one at generation time and ``--chat``
     has to be remembered by hand. ``ModelConfig.from_dict`` ignores the extra keys, so the
-    architecture read back is unaffected.
+    architecture read back is unaffected. Its ``history`` list is the chain of runs behind
+    these weights; :meth:`on_save_checkpoint` stamps this run's results into the last entry.
 
     ``save_hyperparameters`` is given an explicit dict, never called bare: a bare call
     captures ``__init__``'s arguments, which would write ``init_state``'s ~800 MB into
@@ -111,9 +112,47 @@ class LitJLM(L.LightningModule):
         if train_cfg.compile:
             self.model = torch.compile(self.model)
         self._t_prev = None
+        self._t_start = None
 
     def on_train_start(self):
         self._t_prev = time.perf_counter()
+        self._t_start = time.perf_counter()
+        # global_step counts steps across all registered optimizers; MuonAdamW keeps it at 1.
+        assert len(self.trainer.optimizers) == 1, (
+            f"{len(self.trainer.optimizers)} optimizers registered — global_step counts "
+            f"them all, so history tokens_seen would be wrong by that factor")
+
+    def on_load_checkpoint(self, checkpoint):
+        """Same filter as :func:`slm.checkpoint.load`, for the ``--resume`` path Lightning
+        restores itself."""
+        sd = checkpoint.get("state_dict")
+        if sd:
+            for k in [k for k in sd if k.endswith(".tril")]:
+                del sd[k]
+
+    def on_save_checkpoint(self, checkpoint):
+        """Stamp this run's results into its history record; Lightning fills
+        ``hyper_parameters`` first, so each checkpoint carries its own numbers."""
+        hist = (checkpoint.get("hyper_parameters") or {}).get("history")
+        if not hist:
+            return
+        cur = hist[-1]
+        # From the live trainer, not the --devices flag the record was built from.
+        world_size = int(self.trainer.world_size)
+        cur["world_size"] = world_size
+        cur["effective_batch"] = self.train_cfg.batch_size * world_size
+        cur["tokens_per_update"] = cur["effective_batch"] * self.model_cfg.block_size
+        updates = int(self.trainer.global_step)
+        cur["updates"] = updates
+        cur["tokens_seen"] = updates * cur["tokens_per_update"]
+        cur["tokens_seen_total"] = sum(r.get("tokens_seen") or 0 for r in hist)
+        cur["wall_s"] = round(time.perf_counter() - self._t_start, 1) if self._t_start else None
+        # Dropped, not recorded: json.dumps(allow_nan=False) would make `export` refuse it.
+        val = self.trainer.callback_metrics.get("val_loss")
+        if val is not None and math.isfinite(float(val)):
+            cur["val_loss"] = float(val)
+            if self.tokens_per_byte:
+                cur["val_bpb"] = float(val) * self.tokens_per_byte / math.log(2)
 
     def _block_mask(self, seg):
         """Build the per-step attention mask, or None for plain causal attention.
@@ -159,15 +198,22 @@ class LitJLM(L.LightningModule):
         self.log("lr", self.lr_schedulers().get_last_lr()[0], prog_bar=True, on_step=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        """Loader 0 is the representative split; loader 1, when present, is the length band.
+
+        ``add_dataloader_idx=False`` is load-bearing: otherwise Lightning renames these to
+        ``val_loss/dataloader_idx_0`` and ``monitor="val_loss"`` silently never fires.
+        """
         x, y, seg = batch
         targets, scale = self._safe_targets(y)
         _, loss = self.model(x, targets, block_mask=self._block_mask(seg))
         loss = loss * scale
-        self.log("val_loss", loss, prog_bar=True, sync_dist=True)
+        tag = "val" if dataloader_idx == 0 else "val_long"
+        self.log(f"{tag}_loss", loss, prog_bar=True, sync_dist=True, add_dataloader_idx=False)
         tpb = self.tokens_per_byte
         if tpb:
-            self.log("val_bpb", loss * tpb / math.log(2), prog_bar=True, sync_dist=True)
+            self.log(f"{tag}_bpb", loss * tpb / math.log(2), prog_bar=True, sync_dist=True,
+                     add_dataloader_idx=False)
         return loss
 
     def configure_optimizers(self):
@@ -222,16 +268,74 @@ class SLMDataModule(L.LightningDataModule):
                   f"{self.val_corpus.name} is {clean} at batch {self.cfg.batch_size} x "
                   f"{self.world_size} ranks — larger resamples the same windows")
 
-    def _loader(self, corpus, seed: int):
+        # Both resolved here: val is ~6000x smaller, so a train-healthy bound can starve it.
+        for corpus, tag in ((self.train_corpus, "train"), (self.val_corpus, "val")):
+            band = self._band(corpus)
+            if band is None:
+                continue
+            n_docs, n_tokens = corpus.band_docs(self.cfg.long_min_tokens,
+                                                self.cfg.long_max_tokens)
+            n_win = (band[1] - band[0]) // self.model_cfg.block_size
+            readers = self.world_size * max(1, self.cfg.dataloader_workers)
+            assert n_docs > 0 and n_win >= readers, (
+                f"length band [{self.cfg.long_min_tokens}, {self.cfg.long_max_tokens}) "
+                f"leaves {tag} with {n_docs} documents / {n_win} windows against {readers} "
+                f"readers — lower --long-min-tokens, or --dataloader-workers/--devices")
+            if self.trainer.is_global_zero:
+                print(f"{tag} band: {n_docs:,} docs, {n_tokens/1e9:.3f}B tokens, "
+                      f"{n_win:,} windows")
+
+        if self.trainer.is_global_zero:
+            print(f"expected segs_per_window ~{self.expected_segs_per_window():.2f} "
+                  f"(the step-1 tripwire; 1.0 means the mask degenerated to plain causal)")
+
+    def expected_segs_per_window(self) -> float:
+        """What ``segs_per_window`` should read for *this* sampling config — computed, not
+        remembered, since a length band moves it several-fold (~11 short end, ~2 long)."""
+        c, bs = self.train_corpus, self.model_cfg.block_size
+        segs = lambda lo, hi: bs / max(1.0, c.mean_doc_tokens(lo, hi)) + 1
+        p = self.cfg.long_frac if self.cfg.long_min_tokens is not None else 0.0
+        if not p:
+            return segs(None, None)
+        return (1 - p) * segs(None, self.cfg.long_min_tokens) + \
+            p * segs(self.cfg.long_min_tokens, self.cfg.long_max_tokens)
+
+    def _band(self, corpus) -> tuple[int, int] | None:
+        """Token bounds of the oversampled length band, or None when unstratified."""
+        has_bound = self.cfg.long_min_tokens is not None or self.cfg.long_max_tokens is not None
+        assert bool(self.cfg.long_frac) == has_bound, (
+            f"--long-frac ({self.cfg.long_frac}) and --long-min-tokens "
+            f"({self.cfg.long_min_tokens}) must be set together; one alone trains uniformly "
+            f"and would silently ignore the other")
+        if not self.cfg.long_frac:
+            return None
+        assert self.cfg.long_min_tokens is not None, "--long-max-tokens needs --long-min-tokens"
+        lo = corpus.token_offset(self.cfg.long_min_tokens)
+        hi = corpus.token_offset(self.cfg.long_max_tokens)
+        return (lo, corpus.meta["n_tokens"] if hi is None else hi)
+
+    def _loader(self, corpus, seed: int, *, band=None, band_frac: float = 0.0):
         return build_dataloader(
             block_size=self.model_cfg.block_size, batch_size=self.cfg.batch_size, seed=seed,
             rank=self.rank, world_size=self.world_size,
             num_workers=self.cfg.dataloader_workers,
             mask_partial_head=self.spec.render.mask_partial_head,
-            **corpus.loader_kwargs())
+            band=band, band_frac=band_frac, **corpus.loader_kwargs())
 
     def train_dataloader(self):
-        return self._loader(self.train_corpus, window_seed(self.cfg, self.spec.source))
+        return self._loader(self.train_corpus, window_seed(self.cfg, self.spec.source),
+                            band=self._band(self.train_corpus),
+                            band_frac=self.cfg.long_frac)
 
     def val_dataloader(self):
-        return self._loader(self.val_corpus, self.spec.source.seed + 10_000)
+        """Uniform val, plus a band-only val when stratified.
+
+        The uniform one stays the checkpoint monitor; on a length-extension run it measures
+        forgetting, not long-range gain, which is what the band one is for.
+        """
+        seed = self.spec.source.seed + 10_000
+        loaders = [self._loader(self.val_corpus, seed)]
+        band = self._band(self.val_corpus)
+        if band is not None:
+            loaders.append(self._loader(self.val_corpus, seed, band=band, band_frac=1.0))
+        return loaders if len(loaders) > 1 else loaders[0]
