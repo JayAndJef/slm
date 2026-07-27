@@ -50,7 +50,7 @@ class MuonAdamW(torch.optim.Optimizer):
     """A Muon + AdamW pair presented to Lightning as one optimizer.
 
     ``torch.optim.Muon`` only accepts 2D parameters, so the hidden weight matrices and
-    everything else (embeddings, lm_head, LayerNorm gains, biases) need separate
+    everything else (the tied embedding/lm_head, RMSNorm gains) need separate
     optimizers — but Lightning's *automatic* optimization drives a single one. This holds
     both and exposes their own group dicts (the same objects, not copies) as
     ``param_groups``, so an LR scheduler writing ``group["lr"]`` reaches the real
@@ -218,14 +218,19 @@ class LitJLM(L.LightningModule):
 
     def configure_optimizers(self):
         cfg = self.train_cfg
+        named = list(self.named_parameters())
         is_hidden = lambda name, p: ".blocks." in name and p.ndim == 2
-        muon_params = [p for n, p in self.named_parameters() if is_hidden(n, p)]
-        other_params = [p for n, p in self.named_parameters() if not is_hidden(n, p)]
+        muon_params = [p for n, p in named if is_hidden(n, p)]
+        rest = [p for n, p in named if not is_hidden(n, p)]
+        decay = [p for p in rest if p.ndim >= 2]        # tied embedding / lm_head
+        no_decay = [p for p in rest if p.ndim < 2]      # norm gains — never decayed
         opt = MuonAdamW(
             torch.optim.Muon(muon_params, lr=cfg.lr, weight_decay=cfg.weight_decay,
                              momentum=0.95, adjust_lr_fn="match_rms_adamw"),
-            torch.optim.AdamW(other_params, lr=cfg.lr,
-                              weight_decay=cfg.weight_decay, betas=(0.9, 0.95)),
+            torch.optim.AdamW(
+                [{"params": decay, "weight_decay": cfg.weight_decay},
+                 {"params": no_decay, "weight_decay": 0.0}],
+                lr=cfg.lr, betas=(0.9, 0.95)),
         )
         # LambdaLR multiplies base lr by this factor; normalize lr_at to a multiplier.
         sched = torch.optim.lr_scheduler.LambdaLR(

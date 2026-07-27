@@ -93,10 +93,10 @@ class MultiheadSelfAttention(nn.Module):
                  use_sdpa: bool = True, rope_theta: float = 10_000.0):
         # block_size is unused now — kept so the three constructors keep one shape.
         super().__init__()
-        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
         self.num_heads = num_heads
         head_dim = hidden_dim // num_heads
@@ -164,16 +164,16 @@ class SwiGLU(nn.Module):
         super().__init__()
         if middle_size is None:
             middle_size = -(-(8 * hidden_size // 3) // 128) * 128   # ceil to a 128 multiple
-        self.w1 = nn.Linear(hidden_size, middle_size)
-        self.w2 = nn.Linear(hidden_size, middle_size)
-        self.w3 = nn.Linear(middle_size, hidden_size)
+        self.w1 = nn.Linear(hidden_size, middle_size, bias=False)
+        self.w2 = nn.Linear(hidden_size, middle_size, bias=False)
+        self.w3 = nn.Linear(middle_size, hidden_size, bias=False)
 
     def forward(self, x):
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm transformer block: x + attn(ln1(x)), then x + ffn(ln2(x))."""
+    """Pre-norm transformer block: x + attn(norm1(x)), then x + ffn(norm2(x))."""
 
     def __init__(self, hidden_dim: int, num_heads: int, block_size: int,
                  use_sdpa: bool = True, rope_theta: float = 10_000.0):
@@ -181,12 +181,12 @@ class TransformerBlock(nn.Module):
         self.attn = MultiheadSelfAttention(hidden_dim, num_heads, block_size, use_sdpa,
                                            rope_theta)
         self.ffn = SwiGLU(hidden_dim)   # width derived from hidden_dim, not pinned
-        self.ln1 = nn.LayerNorm(hidden_dim)
-        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.norm1 = nn.RMSNorm(hidden_dim)
+        self.norm2 = nn.RMSNorm(hidden_dim)
 
     def forward(self, x, block_mask=None):
-        x = self.attn(self.ln1(x), block_mask) + x
-        x = self.ffn(self.ln2(x)) + x
+        x = self.attn(self.norm1(x), block_mask) + x
+        x = self.ffn(self.norm2(x)) + x
         return x
 
 
@@ -208,7 +208,7 @@ class JLM(nn.Module):
             TransformerBlock(hidden_dim, num_heads, block_size, use_sdpa, rope_theta)
             for _ in range(n_layer)
         ])
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.norm = nn.RMSNorm(hidden_dim)
         self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)   # GPT-2's scale
