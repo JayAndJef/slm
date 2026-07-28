@@ -155,7 +155,8 @@ class TrainConfig:
     """Settings for one training run: optimization, eval, runtime, and where things live."""
 
     # optimization
-    batch_size: int = 48
+    batch_size: int = 48                # per rank, per micro-batch
+    accumulate_grad_batches: int = 1    # micro-batches per optimizer step
     max_steps: int = 30000
     warmup_steps: int = 100
     lr: float = 1e-3
@@ -171,6 +172,9 @@ class TrainConfig:
     long_min_tokens: int | None = None  # lower bound of the oversampled band
     long_max_tokens: int | None = None  # optional upper: docs above it keep their natural rate
     long_frac: float = 0.0              # share of served windows drawn from the band
+
+    # memory
+    grad_checkpoint: bool = False       # recompute each block in backward
 
     # eval / checkpoint
     eval_every: int = 1000              # -> Trainer val_check_interval (steps)

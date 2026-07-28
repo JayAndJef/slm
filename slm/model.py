@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+from torch.utils.checkpoint import checkpoint
 
 from slm.config import ModelConfig
 
@@ -212,6 +213,7 @@ class JLM(nn.Module):
         self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)   # GPT-2's scale
+        self.grad_checkpoint = False   # set by LitJLM; not a ModelConfig field
 
     @classmethod
     def from_config(cls, cfg: ModelConfig) -> "JLM":
@@ -225,10 +227,16 @@ class JLM(nn.Module):
         Targets equal to ``-100`` are excluded from the loss. Nothing produces them during
         pretraining (token ids are unsigned); it is the hook for SFT, where the loss should
         cover answer tokens only.
+
+        ``grad_checkpoint`` recomputes each block in backward; ``use_reentrant=False`` is
+        required because ``block_mask`` is a non-Tensor the reentrant path mishandles.
         """
         stream = self.embedding(x)   # positions come from RoPE inside attention
         for blk in self.blocks:
-            stream = blk(stream, block_mask)
+            if self.grad_checkpoint and self.training:
+                stream = checkpoint(blk, stream, block_mask, use_reentrant=False)
+            else:
+                stream = blk(stream, block_mask)
         logits = self.lm_head(self.norm(stream))
         loss = None
         if targets is not None:

@@ -68,7 +68,9 @@ def _git_stamp() -> str:
 def _run_record(train_cfg, model_cfg, spec, corpus_hash, tokens_per_byte, fingerprint,
                 world_size, run_id, command) -> dict:
     """This run's entry in the checkpoint history: config, provenance, empty results."""
-    effective_batch = train_cfg.batch_size * world_size
+    # batch_size is per rank per micro-batch; the optimization dynamics follow the product.
+    effective_batch = (train_cfg.batch_size * world_size
+                       * train_cfg.accumulate_grad_batches)
     return {
         "run_id": run_id,
         "command": command,
@@ -158,6 +160,7 @@ def train(model_cfg: ModelConfig | None, train_cfg: TrainConfig,
         precision=train_cfg.precision,
         max_steps=train_cfg.max_steps,
         max_epochs=-1,
+        accumulate_grad_batches=train_cfg.accumulate_grad_batches,
         gradient_clip_val=train_cfg.grad_clip,
         val_check_interval=train_cfg.eval_every,
         limit_val_batches=train_cfg.eval_iters,

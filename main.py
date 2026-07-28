@@ -48,6 +48,8 @@ _TRAINING_OPTIONS = [
     click.option("--wandb", is_flag=True, default=None, help="Log to Weights & Biases."),
     click.option("--wandb-project", default=None),
     click.option("--batch-size", type=int, default=None),
+    click.option("--accumulate-grad-batches", type=int, default=None,
+                 help="Micro-batches per optimizer step; multiplies the effective batch."),
     click.option("--max-steps", type=int, default=None),
     click.option("--lr", type=float, default=None, help="Peak learning rate."),
     click.option("--min-lr", type=float, default=None, help="Floor the decay anneals to."),
@@ -71,6 +73,8 @@ _TRAINING_OPTIONS = [
                  help="torch.compile the model (default on for real runs)."),
     click.option("--doc-mask/--no-doc-mask", "doc_mask", default=None,
                  help="Stop attention crossing document boundaries (default on)."),
+    click.option("--grad-checkpoint/--no-grad-checkpoint", "grad_checkpoint", default=None,
+                 help="Recompute blocks in backward: less memory, ~21% more compute."),
     click.option("--tokenizer", "tokenizer_path", type=click.Path(exists=True), default=None),
     click.option("--resume", "resume_from", type=click.Path(exists=True), default=None,
                  help="Lightning .ckpt to continue: optimizer momentum, LR schedule "
@@ -239,7 +243,8 @@ def sft(init_from, out_dir, corpus_name, epochs, **opts):
             raise click.UsageError(
                 f"{train_corpus.name} is not packed, so it records no window length and "
                 f"tokens/step is unknown — pass --max-steps explicitly")
-        per_step = train_cfg.batch_size * block * n_devices(train_cfg.devices)
+        per_step = (train_cfg.batch_size * block * n_devices(train_cfg.devices)
+                    * train_cfg.accumulate_grad_batches)
         train_cfg.max_steps = max(1, round(train_corpus.meta["n_tokens"] * epochs / per_step))
         click.echo(f"{epochs} epochs over {train_corpus.meta['n_tokens']/1e6:.0f}M tokens "
                    f"= {train_cfg.max_steps} steps at {per_step:,} tokens/step")
@@ -562,7 +567,9 @@ def _echo_history(history: list) -> None:
         c = r.get("corpus") or {}
         corpus = f"{c.get('name', '?')} {(c.get('hash') or '')[:8]}".strip()
         theta = r.get("rope_theta")
-        batch = (f"{r['batch_size']}x{r['world_size']}"
+        # per-rank x ranks [x accumulation]; the product is the real batch.
+        accum = r.get("accumulate_grad_batches") or 1
+        batch = (f"{r['batch_size']}x{r['world_size']}" + (f"x{accum}" if accum > 1 else "")
                  if r.get("batch_size") and r.get("world_size") else "-")
         val, bpb, lr, min_lr = (r.get("val_loss"), r.get("val_bpb"),
                                 r.get("lr"), r.get("min_lr"))

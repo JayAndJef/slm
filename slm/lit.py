@@ -61,9 +61,20 @@ class MuonAdamW(torch.optim.Optimizer):
         self.opts = (muon, adamw)
         params = [p for o in self.opts for g in o.param_groups for p in g["params"]]
         super().__init__(params, {})    # gives us Optimizer's zero_grad / hook plumbing
+        self._realias()
+
+    def _realias(self):
+        """Alias ``param_groups`` to the sub-optimizers' own group dicts, by identity — a
+        scheduler writing ``group["lr"]`` must reach the dict the stepper reads."""
         self.param_groups = [g for o in self.opts for g in o.param_groups]
 
     def step(self, closure=None):
+        # Tripwire: a rebound sub-optimizer group silently strands the scheduler.
+        live = [g for o in self.opts for g in o.param_groups]
+        assert len(live) == len(self.param_groups) and all(
+            a is b for a, b in zip(live, self.param_groups)), (
+            "param_groups drifted from the sub-optimizers' — the LR scheduler is writing "
+            "into orphaned dicts and the real learning rate is frozen")
         loss = closure() if closure is not None else None
         for o in self.opts:
             o.step()
@@ -73,8 +84,11 @@ class MuonAdamW(torch.optim.Optimizer):
         return {"opts": [o.state_dict() for o in self.opts]}
 
     def load_state_dict(self, state_dict):
-        for o, sd in zip(self.opts, state_dict["opts"]):
+        """Restore both sub-optimizers, then re-alias: ``Optimizer.load_state_dict`` rebinds
+        ``param_groups``, orphaning ours, which froze the LR on every ``--resume``."""
+        for o, sd in zip(self.opts, state_dict["opts"], strict=True):
             o.load_state_dict(sd)
+        self._realias()
 
 
 class LitJLM(L.LightningModule):
@@ -109,6 +123,8 @@ class LitJLM(L.LightningModule):
         self.model = JLM.from_config(model_cfg)
         if init_state is not None:
             self.model.load_state_dict(init_state)
+        # Before compile, or the attribute lands on the wrapper.
+        self.model.grad_checkpoint = train_cfg.grad_checkpoint
         if train_cfg.compile:
             self.model = torch.compile(self.model)
         self._t_prev = None
@@ -139,8 +155,10 @@ class LitJLM(L.LightningModule):
         cur = hist[-1]
         # From the live trainer, not the --devices flag the record was built from.
         world_size = int(self.trainer.world_size)
+        accum = int(self.trainer.accumulate_grad_batches)
         cur["world_size"] = world_size
-        cur["effective_batch"] = self.train_cfg.batch_size * world_size
+        cur["accumulate_grad_batches"] = accum
+        cur["effective_batch"] = self.train_cfg.batch_size * world_size * accum
         cur["tokens_per_update"] = cur["effective_batch"] * self.model_cfg.block_size
         updates = int(self.trainer.global_step)
         cur["updates"] = updates
@@ -266,6 +284,7 @@ class SLMDataModule(L.LightningDataModule):
             c.assert_compatible(self.model_cfg, tokenizer_fingerprint=fingerprint,
                                 doc_mask=self.cfg.doc_mask)
 
+        # No accumulation factor: validation does not accumulate.
         clean = max(1, n_windows(self.val_corpus.meta["n_tokens"], self.model_cfg.block_size)
                     // max(1, self.cfg.batch_size * self.world_size))
         if self.cfg.eval_iters != clean and self.trainer.is_global_zero:
