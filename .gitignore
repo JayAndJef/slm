@@ -35,5 +35,10 @@ lightning_logs/
 # Notebook scratch
 .ipynb_checkpoints/
 
+# Credentials. No leading slash, so it matches at any depth — the R2 keys are pasted
+# wherever is convenient, and a bucket secret in a public repo is not recoverable by
+# deleting it later.
+.r2env
+
 # Local tool settings
 .claude/settings.local.json
