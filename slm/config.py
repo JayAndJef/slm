@@ -129,10 +129,10 @@ class ModelConfig:
     """The five dimensions that define a JLM transformer's architecture."""
 
     vocab_size: int = 32_000
-    hidden_dim: int = 1024
-    num_heads: int = 16
-    n_layer: int = 12
-    block_size: int = 1024
+    hidden_dim: int = 1536
+    num_heads: int = 12
+    n_layer: int = 16
+    block_size: int = 2048
     rope_theta: float = 10_000.0        # RoPE base; raise it when extending context
 
     @classmethod
@@ -155,11 +155,11 @@ class TrainConfig:
     """Settings for one training run: optimization, eval, runtime, and where things live."""
 
     # optimization
-    batch_size: int = 48                # per rank, per micro-batch
+    batch_size: int = 24                # per rank, per micro-batch
     accumulate_grad_batches: int = 1    # micro-batches per optimizer step
     max_steps: int = 30000
-    warmup_steps: int = 100
-    lr: float = 1e-3
+    warmup_steps: int = 500
+    lr: float = 1.2e-3
     min_lr: float = 1e-4
     decay_frac: float = 0.2             # trailing fraction of max_steps spent decaying
     weight_decay: float = 0.1
@@ -193,7 +193,7 @@ class TrainConfig:
     devices: str = "1"                  # GPU count (e.g. "1", "2"), or comma-list ("0,1")
     num_nodes: int = 1
     precision: str = "bf16-mixed"
-    dataloader_workers: int = 2         # per-rank DataLoader workers
+    dataloader_workers: int = 4         # per-rank DataLoader workers
     wandb: bool = False
     wandb_project: str = "jlm"
 

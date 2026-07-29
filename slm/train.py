@@ -42,6 +42,17 @@ def n_devices(spec: str) -> int:
     return torch.cuda.device_count() if devices < 0 else max(1, devices)
 
 
+def tokens_per_update(train_cfg: TrainConfig, block_size: int) -> int:
+    """Tokens per *optimizer* step: four multipliers, of which ``batch_size`` is only the
+    first (it is per rank per micro-batch; DDP and accumulation multiply it again).
+
+    Beside :func:`n_devices` because that is where the world-size subtlety already lives.
+    """
+    return (train_cfg.batch_size * block_size
+            * n_devices(train_cfg.devices) * train_cfg.num_nodes
+            * train_cfg.accumulate_grad_batches)
+
+
 def _make_logger(cfg: TrainConfig, run_id: str):
     """Pass the run id through, so a restart appends to that run instead of forking a new one."""
     if cfg.wandb:
@@ -104,7 +115,7 @@ def _parent_history(meta: dict) -> list:
 
 def train(model_cfg: ModelConfig | None, train_cfg: TrainConfig,
           spec, train_corpus, val_corpus, model_overrides: dict | None = None,
-          command: str | None = None):
+          command: str | None = None, target_tokens: float | None = None):
     """Fit a model with Lightning; returns the path to the compact best checkpoint.
 
     With ``train_cfg.init_from`` set, the run starts from that checkpoint's **weights** —
@@ -144,6 +155,14 @@ def train(model_cfg: ModelConfig | None, train_cfg: TrainConfig,
     devices = parse_devices(train_cfg.devices)
     n_ranks = n_devices(train_cfg.devices)
     strategy = "ddp" if n_ranks > 1 else "auto"
+
+    if target_tokens is not None:
+        per_update = tokens_per_update(train_cfg, model_cfg.block_size)
+        train_cfg.max_steps = max(1, round(target_tokens / per_update))
+        print(f"{target_tokens/1e9:.3f}B tokens = {train_cfg.max_steps:,} steps at "
+              f"{per_update:,} tokens/step ({train_cfg.batch_size} per rank x "
+              f"{n_ranks * train_cfg.num_nodes} ranks x "
+              f"{train_cfg.accumulate_grad_batches} accum x {model_cfg.block_size})")
 
     # Before the logger: a resume must reuse the run id or W&B forks a new run.
     resumed_history = []

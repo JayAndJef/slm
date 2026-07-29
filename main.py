@@ -23,7 +23,7 @@ from slm.generate import EOT, is_chat_checkpoint, load_model, tokenizer_for
 from slm.model import JLM
 from slm.generate import stream as run_stream
 from slm.tokenizer import HFTokenizer, SimpleTokenizer, load_tokenizer
-from slm.train import n_devices
+from slm.train import tokens_per_update
 from slm.train import train as run_train
 
 # Flags shared by every command that runs a training loop. Declared once and applied by
@@ -76,6 +76,9 @@ _TRAINING_OPTIONS = [
     click.option("--grad-checkpoint/--no-grad-checkpoint", "grad_checkpoint", default=None,
                  help="Recompute blocks in backward: less memory, ~21% more compute."),
     click.option("--tokenizer", "tokenizer_path", type=click.Path(exists=True), default=None),
+    click.option("--data-dir", type=click.Path(exists=True), default=None,
+                 help="Where the encoded corpus lives. Defaults to <repo>/data; pass it when "
+                      "the corpus sits on a scratch mount the repo is not on."),
     click.option("--resume", "resume_from", type=click.Path(exists=True), default=None,
                  help="Lightning .ckpt to continue: optimizer momentum, LR schedule "
                       "position and loop counters restored. The window stream is NOT — it "
@@ -111,6 +114,13 @@ def cli():
     """From-scratch small language model: train, generate, or train a tokenizer."""
 
 
+def _reject_both(target_tokens, opts) -> None:
+    """``--target-tokens`` and ``--max-steps`` set the same number, and the pair silently
+    disagrees the moment ``--devices`` or ``--batch-size`` moves."""
+    if target_tokens is not None and opts.get("max_steps") is not None:
+        raise click.UsageError("--target-tokens and --max-steps both given — pass one")
+
+
 def _require_corpus(spec, train_cfg, *, smoke: bool):
     """Locate an already-built corpus pair, or explain how to build it.
 
@@ -143,8 +153,11 @@ def _require_corpus(spec, train_cfg, *, smoke: bool):
 @click.option("--n-layer", type=int, default=None)
 @click.option("--block-size", type=int, default=None)
 @click.option("--rope-theta", type=float, default=None, help="RoPE base frequency.")
+@click.option("--target-tokens", type=float, default=None,
+              help="Token budget for the run; sets --max-steps from it. Use this instead of "
+                   "--max-steps when the device count is not known until launch.")
 def train(smoke, corpus_name, out_dir, vocab_size, hidden_dim, num_heads, n_layer,
-          block_size, rope_theta, **opts):
+          block_size, rope_theta, target_tokens, **opts):
     """Train a model from scratch with Lightning (or a tiny --smoke run)."""
     if out_dir is None and not smoke:
         raise click.UsageError(
@@ -157,7 +170,9 @@ def train(smoke, corpus_name, out_dir, vocab_size, hidden_dim, num_heads, n_laye
     _apply(model_cfg, vocab_size=vocab_size, hidden_dim=hidden_dim, num_heads=num_heads,
            n_layer=n_layer, block_size=block_size, rope_theta=rope_theta)
     _apply(train_cfg, out_dir=out_dir, **opts)
-    run_train(model_cfg, train_cfg, spec, *_require_corpus(spec, train_cfg, smoke=smoke))
+    _reject_both(target_tokens, opts)
+    run_train(model_cfg, train_cfg, spec, *_require_corpus(spec, train_cfg, smoke=smoke),
+              target_tokens=target_tokens)
 
 
 @cli.command("continue-train")
@@ -174,7 +189,11 @@ def train(smoke, corpus_name, out_dir, vocab_size, hidden_dim, num_heads, n_laye
                    "weights still load; pair with --rope-theta when extending.")
 @click.option("--rope-theta", type=float, default=None,
               help="RoPE base frequency. Raise it with --block-size (e.g. 500000 at 8192).")
-def continue_train(init_from, out_dir, corpus_name, block_size, rope_theta, **opts):
+@click.option("--target-tokens", type=float, default=None,
+              help="Token budget for the run; sets --max-steps from it, using the block size "
+                   "this run will actually train at (--block-size, else the checkpoint's).")
+def continue_train(init_from, out_dir, corpus_name, block_size, rope_theta, target_tokens,
+                   **opts):
     """Continue training from a checkpoint's weights under a fresh LR schedule.
 
     Weights only — the compact format carries no optimizer moments, scheduler position or
@@ -194,10 +213,11 @@ def continue_train(init_from, out_dir, corpus_name, block_size, rope_theta, **op
     train_cfg.max_steps, train_cfg.warmup_steps = 4_000, 0
     train_cfg.lr, train_cfg.min_lr, train_cfg.decay_frac = 1e-4, 0.0, 1.0
     _apply(train_cfg, **opts)
+    _reject_both(target_tokens, opts)
     overrides = {k: v for k, v in
                  (("block_size", block_size), ("rope_theta", rope_theta)) if v is not None}
     run_train(None, train_cfg, spec, *_require_corpus(spec, train_cfg, smoke=False),
-              model_overrides=overrides)
+              model_overrides=overrides, target_tokens=target_tokens)
 
 
 @cli.command()
@@ -243,8 +263,7 @@ def sft(init_from, out_dir, corpus_name, epochs, **opts):
             raise click.UsageError(
                 f"{train_corpus.name} is not packed, so it records no window length and "
                 f"tokens/step is unknown — pass --max-steps explicitly")
-        per_step = (train_cfg.batch_size * block * n_devices(train_cfg.devices)
-                    * train_cfg.accumulate_grad_batches)
+        per_step = tokens_per_update(train_cfg, block)
         train_cfg.max_steps = max(1, round(train_corpus.meta["n_tokens"] * epochs / per_step))
         click.echo(f"{epochs} epochs over {train_corpus.meta['n_tokens']/1e6:.0f}M tokens "
                    f"= {train_cfg.max_steps} steps at {per_step:,} tokens/step")

@@ -33,8 +33,10 @@ def lr_at(step: int, cfg: TrainConfig) -> float:
     phase, run the decay, and you have a finished model. Cosine has to know ``max_steps``
     up front, and truncating it leaves the LR stranded mid-decay.
 
-    The decay uses ``1 - sqrt(progress)``, which holds the peak longer than a linear ramp
-    and empirically edges it out; the last ``decay_frac`` of the run is spent on it.
+    The decay is linear in ``progress`` over the last ``decay_frac`` of the run, so half the
+    window stays above half-peak. It was ``1 - sqrt(progress)``, which front-loads the drop:
+    that reaches half-peak a *quarter* of the way in, spending three quarters of the decay
+    below it.
     """
     if step < cfg.warmup_steps:
         return cfg.lr * (step + 1) / cfg.warmup_steps
@@ -43,7 +45,7 @@ def lr_at(step: int, cfg: TrainConfig) -> float:
     if step < stable_end:
         return cfg.lr
     prog = min(1.0, (step - stable_end) / decay_steps)
-    return cfg.min_lr + (cfg.lr - cfg.min_lr) * (1 - math.sqrt(prog))
+    return cfg.min_lr + (cfg.lr - cfg.min_lr) * (1 - prog)
 
 
 class MuonAdamW(torch.optim.Optimizer):
