@@ -374,7 +374,7 @@ def default_configs(smoke: bool = False) -> tuple[ModelConfig, TrainConfig, Corp
     ``checkpoints/smoke/`` so a real run's output is never touched.
     """
     if not smoke:
-        return ModelConfig(), TrainConfig(), corpus_preset("cosmopedia")
+        return ModelConfig(), TrainConfig(), corpus_preset("smollm")
 
     model = ModelConfig(hidden_dim=128, num_heads=4, n_layer=4, block_size=128)
     train = TrainConfig(
