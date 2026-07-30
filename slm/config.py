@@ -167,6 +167,7 @@ class TrainConfig:
     compile: bool = True                # torch.compile the model (CUDA only)
     doc_mask: bool = True               # stop attention crossing document boundaries
     sampler_seed: int | None = None     # window order only; None = follow the source seed
+    window_offset: int = 0              # skip this many windows of pass 0 (see window_seed)
 
     # Length-band oversampling; needs a pack="sorted" corpus. All read-time, never hashed.
     long_min_tokens: int | None = None  # lower bound of the oversampled band

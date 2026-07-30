@@ -66,6 +66,8 @@ _TRAINING_OPTIONS = [
                  help="Share of windows drawn from the band (e.g. 0.4)."),
     click.option("--sampler-seed", type=int, default=None,
                  help="Reshuffles the window order without renaming the corpus cache."),
+    click.option("--window-offset", type=int, default=None,
+                 help="Skip this many windows of pass 0, so a resume does not replay them."),
     click.option("--eval-every", type=int, default=None, help="Steps between validations."),
     click.option("--eval-iters", type=int, default=None,
                  help="Val batches per rank (18 is one clean pass at batch 48 x 4 ranks)."),

@@ -340,18 +340,21 @@ class SLMDataModule(L.LightningDataModule):
         hi = corpus.token_offset(self.cfg.long_max_tokens)
         return (lo, corpus.meta["n_tokens"] if hi is None else hi)
 
-    def _loader(self, corpus, seed: int, *, band=None, band_frac: float = 0.0):
+    def _loader(self, corpus, seed: int, *, band=None, band_frac: float = 0.0,
+                window_offset: int = 0):
         return build_dataloader(
             block_size=self.model_cfg.block_size, batch_size=self.cfg.batch_size, seed=seed,
             rank=self.rank, world_size=self.world_size,
             num_workers=self.cfg.dataloader_workers,
             mask_partial_head=self.spec.render.mask_partial_head,
-            band=band, band_frac=band_frac, **corpus.loader_kwargs())
+            band=band, band_frac=band_frac, window_offset=window_offset,
+            **corpus.loader_kwargs())
 
     def train_dataloader(self):
         return self._loader(self.train_corpus, window_seed(self.cfg, self.spec.source),
                             band=self._band(self.train_corpus),
-                            band_frac=self.cfg.long_frac)
+                            band_frac=self.cfg.long_frac,
+                            window_offset=self.cfg.window_offset)
 
     def val_dataloader(self):
         """Uniform val, plus a band-only val when stratified.

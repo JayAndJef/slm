@@ -63,12 +63,15 @@ class WindowIterableDataset(IterableDataset):
 
     Reusing one slice for both would leave the mask silently one position out, which no loss
     curve reveals.
+
+    ``window_offset`` skips that many windows of pass 0, so a resume does not replay them.
     """
 
     def __init__(self, token_path, block_size: int, base_seed: int,
                  rank: int = 0, world_size: int = 1, sep_id: int | None = None,
                  target_path=None, start_path=None, mask_partial_head: bool = True,
-                 band: tuple[int, int] | None = None, band_frac: float = 0.0):
+                 band: tuple[int, int] | None = None, band_frac: float = 0.0,
+                 window_offset: int = 0):
         super().__init__()
         self.token_path = str(token_path)
         self.target_path = None if target_path is None else str(target_path)
@@ -81,8 +84,10 @@ class WindowIterableDataset(IterableDataset):
         self.mask_partial_head = mask_partial_head
         self.band = band                # (lo_token, hi_token) into a length-sorted stream
         self.band_frac = band_frac      # share of served windows drawn from it
+        self.window_offset = window_offset   # windows of pass 0 a parent run already served
         assert 0.0 <= band_frac <= 1.0, f"band_frac must be in [0, 1], got {band_frac}"
         assert band is None or band_frac > 0, "a band with band_frac=0 would never be drawn"
+        assert window_offset >= 0, f"window_offset must be >= 0, got {window_offset}"
 
     def _epoch_order(self, n_win: int, epoch: int) -> np.ndarray:
         """Window indices for one pass; a plain permutation unless a length band is set.
@@ -151,6 +156,11 @@ class WindowIterableDataset(IterableDataset):
         epoch = 0
         while True:
             order = self._epoch_order(n_win, epoch)
+            if epoch == 0 and self.window_offset:
+                assert self.window_offset < len(order), (
+                    f"--window-offset {self.window_offset} is at or past pass 0's "
+                    f"{len(order)} windows; recompute it as updates x batch x ranks x accum")
+                order = order[self.window_offset:]
             # On the served order, not the corpus: an empty shard slice spins here forever.
             assert len(order) >= n_shards, (
                 f"{len(order)} windows to serve but {n_shards} readers "
@@ -191,13 +201,14 @@ def build_dataloader(token_path, *, block_size: int, batch_size: int, seed: int,
                      sep_id: int | None = None, target_path=None, start_path=None,
                      mask_partial_head: bool = True,
                      band: tuple[int, int] | None = None,
-                     band_frac: float = 0.0) -> DataLoader:
+                     band_frac: float = 0.0, window_offset: int = 0) -> DataLoader:
     """DataLoader over :class:`WindowIterableDataset`; default collate stacks windows."""
     ds = WindowIterableDataset(token_path, block_size=block_size, base_seed=seed,
                                rank=rank, world_size=world_size, sep_id=sep_id,
                                target_path=target_path, start_path=start_path,
                                mask_partial_head=mask_partial_head,
-                               band=band, band_frac=band_frac)
+                               band=band, band_frac=band_frac,
+                               window_offset=window_offset)
     return DataLoader(
         ds, batch_size=batch_size, num_workers=num_workers, pin_memory=True,
         persistent_workers=num_workers > 0,
