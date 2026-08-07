@@ -136,6 +136,5 @@ uv run main.py sft --init-from checkpoints/run1/step<N>-val<X>.ckpt \
 uv run main.py export checkpoints/sft/step<N>-val<X>.ckpt --out model.pt
 ```
 
-`--help` on any command explains its flags. `CLAUDE.md` documents the architecture decisions,
-the corpus/hash design, and the measurements behind the defaults.
+`--help` on any command explains its flags.
 
