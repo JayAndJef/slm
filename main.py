@@ -3,7 +3,8 @@
     uv run main.py train [--smoke] [--hidden-dim N ...]
     uv run main.py continue-train --init-from PATH --out-dir PATH
     uv run main.py prepare-data [--smoke]
-    uv run main.py generate [--checkpoint PATH] [--prompt STR]
+    uv run main.py generate --checkpoint PATH [--prompt STR]
+    uv run main.py chat --checkpoint PATH
     uv run main.py train-tokenizer --out PATH
 
 Each command builds config objects and calls exactly one package function.
@@ -19,7 +20,8 @@ import torch
 from slm import chat, checkpoint, corpus, paths
 from slm.config import (CORPUS_PRESETS, SEP, TrainConfig, corpus_preset,
                         default_configs)
-from slm.generate import EOT, is_chat_checkpoint, load_model, tokenizer_for
+from slm.generate import (EOT, fit_history, is_chat_checkpoint, load_model,
+                          tokenizer_for)
 from slm.model import JLM
 from slm.generate import stream as run_stream
 from slm.tokenizer import HFTokenizer, SimpleTokenizer, load_tokenizer
@@ -283,7 +285,8 @@ def sft(init_from, out_dir, corpus_name, epochs, **opts):
 @click.option("--arc/--no-arc", "run_arc", default=True,
               help="Score ARC-Easy for capability regression (the Phase 7 gate).")
 @click.option("--arc-items", type=int, default=200, show_default=True)
-@click.option("--device", default="cuda:6", show_default=True)
+@click.option("--device", default="auto", show_default=True,
+              help="\"auto\" picks the CUDA card with the most free memory.")
 def sft_eval(checkpoint, tokenizer_path, chat_mode, prompts_path, max_new_tokens,
              run_arc, arc_items, device):
     """Measure what SFT changed: does it answer, does it stop, and did it forget.
@@ -293,7 +296,7 @@ def sft_eval(checkpoint, tokenizer_path, chat_mode, prompts_path, max_new_tokens
     """
     from slm import evaluate
 
-    dev = torch.device(device)
+    dev = _pick_device(device)
     model, cfg, meta = load_model(checkpoint, dev)
     tok = tokenizer_for(meta, cfg, tokenizer_path)
     prompts = json.loads(Path(prompts_path).read_text())["prompts"]
@@ -447,16 +450,19 @@ def prepare_data(smoke, corpus_name, tokenizer_path, data_dir, workers, dry_run,
 
 
 @cli.command()
-@click.option("--checkpoint", type=click.Path(exists=True),
-              default=str(paths.CKPT_DIR / "best.pt"), show_default=True)
+@click.option("--checkpoint", type=click.Path(exists=True), required=True,
+              help="Any format: a Lightning .ckpt from a run's --out-dir, or an exported "
+                   ".pt. Required — training writes into --out-dir, so no path is a default.")
 @click.option("--prompt", default=EOT, help="Text to continue.")
 @click.option("--max-new-tokens", type=int, default=250)
-@click.option("--temperature", type=float, default=0.8)
-@click.option("--top-p", type=float, default=0.9, show_default=True,
+@click.option("--temperature", type=float, default=1.0, show_default=True)
+@click.option("--top-p", type=float, default=0.95, show_default=True,
               help="Nucleus sampling: keep the top tokens summing to this mass. "
-                   "1.0 disables it.")
+                   "1.0 disables it. Measured at 2048 tokens on the 502M base model: "
+                   "0.8/0.9 cycles verbatim by ~300 tokens, 1.0/0.95 by ~760.")
 @click.option("--num-samples", type=int, default=2)
-@click.option("--device", default="cuda:3")
+@click.option("--device", default="auto", show_default=True,
+              help="\"auto\" picks the CUDA card with the most free memory.")
 @click.option("--tokenizer", "tokenizer_path", type=click.Path(exists=True), default=None,
               help="Defaults to the tokenizer embedded in the checkpoint, else "
                    f"{paths.TOKENIZER_PATH}.")
@@ -466,28 +472,137 @@ def prepare_data(smoke, corpus_name, tokenizer_path, data_dir, workers, dry_run,
 def generate(checkpoint, prompt, max_new_tokens, temperature, top_p, num_samples, device,
              tokenizer_path, chat_mode):
     """Generate text from a trained checkpoint."""
-    dev = torch.device(device)
-    model, cfg, meta = load_model(checkpoint, dev)
-
-    tok = tokenizer_for(meta, cfg, tokenizer_path)
+    model, cfg, meta, tok, dev = _load_for_inference(checkpoint, tokenizer_path, device)
     if chat_mode is None:
         chat_mode = is_chat_checkpoint(meta)
     stop_id = tok.special_id(chat.IM_END) if chat_mode else None
     if chat_mode:
-        prompt = chat.render_prompt([{"role": "user", "content": prompt}])
+        prompt = chat.render_prompt([{"role": "user", "content": prompt}],
+                                    tok.declared_specials)
+    click.echo(f"{'chat' if chat_mode else 'base'} mode\n")
 
-    n_params = sum(p.numel() for p in model.parameters())
-    val_str = "n/a" if meta["val"] is None else f"{meta['val']:.3f}"
-    click.echo(f"loaded {checkpoint}: step {meta['step']}, val {val_str}, "
-               f"{n_params/1e6:.1f}M params{', chat' if chat_mode else ''}\n")
     for i in range(num_samples):
         click.echo(f"--- sample {i + 1} (temp {temperature}, top_p {top_p}) ---")
-        for chunk in run_stream(model, tok, prompt=prompt, max_new_tokens=max_new_tokens,
-                                temperature=temperature, top_p=top_p, stop_id=stop_id,
-                                block_size=cfg.block_size, device=dev):
+        _echo_stream(model, tok, prompt=prompt, max_new_tokens=max_new_tokens,
+                     temperature=temperature, top_p=top_p, stop_id=stop_id,
+                     block_size=cfg.block_size, device=dev)
+        click.echo("\n")
+
+
+def _load_for_inference(checkpoint, tokenizer_path, device):
+    """Resolve the device, load the weights, pair the tokenizer, and say what was loaded.
+
+    Shared by ``generate`` and ``chat`` so the two cannot drift on which tokenizer they pair
+    or which card they land on — the same reasoning as ``_TRAINING_OPTIONS``.
+    """
+    dev = _pick_device(device)
+    model, cfg, meta = load_model(checkpoint, dev)
+    tok = tokenizer_for(meta, cfg, tokenizer_path)
+    val = meta.get("val")
+    click.echo(f"loaded {checkpoint}: step {meta.get('step')}, "
+               f"val {'n/a' if val is None else f'{val:.3f}'}, "
+               f"{sum(p.numel() for p in model.parameters())/1e6:.1f}M params, "
+               f"ctx {cfg.block_size} on {dev}")
+    return model, cfg, meta, tok, dev
+
+
+def _echo_stream(model, tok, **kwargs) -> str:
+    """Stream a continuation to stdout as it arrives; return the whole text.
+
+    Swallows Ctrl-C so a long generation can be cut short without losing what it already
+    produced: the chat loop puts that partial text into the history, which is what the user
+    actually saw and what the next turn has to be consistent with.
+    """
+    out = []
+    try:
+        for chunk in run_stream(model, tok, **kwargs):
             click.echo(chunk, nl=False)
             click.get_text_stream("stdout").flush()
-        click.echo("\n")
+            out.append(chunk)
+    except KeyboardInterrupt:
+        click.echo(" [interrupted]", nl=False)
+    return "".join(out)
+
+
+def _pick_device(spec: str) -> torch.device:
+    """Resolve ``--device``; ``auto`` takes the CUDA card with the most free memory.
+
+    A fixed index is wrong on a shared box. PyTorch orders devices FASTEST_FIRST rather than
+    by PCI id, so ``cuda:0`` is whichever card it ranks fastest — here a Blackwell, which is
+    routinely the one already running a training job.
+    """
+    if spec != "auto":
+        return torch.device(spec)
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    free = max((torch.cuda.mem_get_info(i)[0], i) for i in range(torch.cuda.device_count()))
+    return torch.device(f"cuda:{free[1]}")
+
+
+@cli.command("chat")
+@click.option("--checkpoint", type=click.Path(exists=True), required=True)
+@click.option("--tokenizer", "tokenizer_path", type=click.Path(exists=True), default=None,
+              help="Defaults to the tokenizer embedded in the checkpoint.")
+@click.option("--system", default=None,
+              help="System prompt. Folded into the first user turn, as training rendered it.")
+@click.option("--max-new-tokens", type=int, default=512, show_default=True)
+@click.option("--temperature", type=float, default=1.0, show_default=True)
+@click.option("--top-p", type=float, default=0.95, show_default=True)
+@click.option("--device", default="auto", show_default=True,
+              help="\"auto\" picks the CUDA card with the most free memory.")
+def chat_cmd(checkpoint, tokenizer_path, system, max_new_tokens, temperature, top_p, device):
+    """Multi-turn conversation with a fine-tuned model.
+
+    Distinct from ``generate --chat``, which renders a single user turn and exits: with no
+    history the model cannot use anything said earlier, which is most of what an
+    instruction-tuned model is for.
+
+    The prompt is built by :func:`slm.chat.render_prompt` over the whole history, so the
+    context shape is the one SFT trained on. ``/reset`` clears the history, ``/exit`` quits.
+    """
+    model, cfg, meta, tok, dev = _load_for_inference(checkpoint, tokenizer_path, device)
+    chat_ckpt = is_chat_checkpoint(meta)
+    if not chat_ckpt:
+        click.echo("warning: this checkpoint's corpus was not rendered as chat, so it will "
+                   "continue your text rather than answer it")
+    # None -> stream stops on the document separator. A base model never emits <|im_end|>,
+    # so stopping on it means every turn runs the full budget and appends the overrun to
+    # history as an "assistant turn", filling the context with junk in a few turns.
+    stop_id = tok.special_id(chat.IM_END) if chat_ckpt else None
+    click.echo("/reset clears history, /exit quits\n")
+
+    history: list[dict] = []
+    while True:
+        try:
+            line = click.prompt("you", prompt_suffix="> ")
+        except (EOFError, click.Abort):
+            click.echo()
+            return
+        if line.strip() in ("/exit", "/quit"):
+            return
+        if line.strip() == "/reset":
+            history.clear()
+            click.echo("(history cleared)\n")
+            continue
+
+        history.append({"role": "user", "content": line})
+        prompt, n_ctx, kept = fit_history(history, tokenizer=tok, block_size=cfg.block_size,
+                                          reserve=max_new_tokens, system=system)
+        if len(kept) < len(history):
+            click.echo(f"(dropped {(len(history) - len(kept)) // 2} old exchange(s) to fit "
+                       f"ctx {cfg.block_size})")
+            history[:] = kept            # adopt it, or history grows unbounded
+        if n_ctx + max_new_tokens > cfg.block_size:
+            click.echo(f"warning: {n_ctx} prompt tokens + {max_new_tokens} reserved exceeds "
+                       f"ctx {cfg.block_size} — the head is cropped, so the role header and "
+                       f"any --system prompt are lost")
+
+        click.echo("bot> ", nl=False)
+        reply = _echo_stream(model, tok, prompt=prompt, max_new_tokens=max_new_tokens,
+                             temperature=temperature, top_p=top_p, stop_id=stop_id,
+                             block_size=cfg.block_size, device=dev)
+        click.echo(f"\n[{n_ctx} prompt tokens]\n")
+        history.append({"role": "assistant", "content": reply})
 
 
 @cli.command()

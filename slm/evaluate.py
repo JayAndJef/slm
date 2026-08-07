@@ -91,7 +91,7 @@ def format_compliance(model, tokenizer, questions: list[str], *, block_size: int
     instruction-following.
     """
     stop_id = tokenizer.special_id(chat.IM_END if chat_mode else chat.EOT)
-    prompts = [chat.render_prompt([{"role": "user", "content": q}]) if chat_mode else q
+    prompts = [chat.render_prompt([{"role": "user", "content": q}], tokenizer.declared_specials) if chat_mode else q
                for q in questions]
     gens = greedy_batch(model, tokenizer, prompts, max_new_tokens=max_new_tokens,
                         block_size=block_size, device=device, stop_id=stop_id)

@@ -101,6 +101,14 @@ class Tokenizer(Protocol):
         must strip it. This takes the bare marker.
         """
 
+    @property
+    def declared_specials(self) -> tuple[str, ...]:
+        """Every string this tokenizer encodes as a special, for sanitizing user content.
+
+        Read from the backend rather than rebuilt by :func:`slm.chat.specials`, which would
+        guess the block size and match renamed slots by a name they no longer have.
+        """
+
 
 def load_tokenizer(path) -> Tokenizer:
     """Load whichever backend wrote ``path``, deciding from the file itself.
@@ -245,6 +253,12 @@ class SimpleTokenizer:
         return ids[0]
 
     @property
+    def declared_specials(self) -> tuple[str, ...]:
+        """Empty: this backend declares nothing, so no string is encoded as a special and
+        there is nothing content could forge."""
+        return ()
+
+    @property
     def fingerprint(self) -> str:
         """Digest of the whole vocabulary — this backend declares no reserved block, so
         there is no range to exclude."""
@@ -378,6 +392,18 @@ class HFTokenizer:
             f"declared specials occupy ids {ids}, not a contiguous block from 0 — the "
             f"fingerprint's reserved range assumes they do; re-run train-tokenizer")
         return len(ids)
+
+    @property
+    def declared_specials(self) -> tuple[str, ...]:
+        """The special strings *this file* declares, read back rather than reconstructed.
+
+        ``chat.specials()`` rebuilds the block from ``N_RESERVED`` and would disagree with a
+        tokenizer trained at a different ``--reserved``, or with one whose reserved slot has
+        been renamed — both supported. Sanitizing content against a guessed block leaves live
+        specials unstripped, so the set has to come from the file.
+        """
+        decoder = self._tk.get_added_tokens_decoder()
+        return tuple(getattr(t, "content", str(t)) for _, t in sorted(decoder.items()))
 
     @property
     def fingerprint(self) -> str:

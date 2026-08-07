@@ -311,7 +311,9 @@ def _cosmopedia() -> CorpusSpec:
     )
 
 
-def _smoltalk2(block_size: int = 1024) -> CorpusSpec:
+def _smoltalk2(block_size: int = 2048) -> CorpusSpec:
+    """Bins are sized to the model's context: ``assert_compatible`` requires
+    ``pack_block == block_size``, so a 1024-packed corpus cannot fine-tune a 2048 model."""
     return CorpusSpec(
         source=SourceSpec(
             "HuggingFaceTB/smoltalk2",

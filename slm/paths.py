@@ -30,6 +30,16 @@ os.environ.setdefault("HF_HOME", HF_CACHE_DIR)
 os.environ.setdefault("HF_HUB_CACHE", str(Path(HF_CACHE_DIR) / "hub"))
 os.environ.setdefault("HF_XET_CACHE", str(Path(HF_CACHE_DIR) / "xet"))
 
+# torch.compile's caches, which default to /tmp/torchinductor_$USER and ~/.triton — both on
+# near-full filesystems on this machine, where a long compiled run fills them and dies.
+# Machine-specific like HF_CACHE_DIR, and deliberately NOT derived from it: HF_HOME is a
+# HuggingFace pointer whose usual value is $HOME/.cache/huggingface, so following it would
+# put the compile cache back on the filesystem this exists to keep it off.
+CACHE_DIR = os.environ.get("SLM_CACHE_DIR", "/data/zejiaqi/cache")
+
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(Path(CACHE_DIR) / "inductor"))
+os.environ.setdefault("TRITON_CACHE_DIR", str(Path(CACHE_DIR) / "triton"))
+
 if "huggingface_hub" in sys.modules:            # too late to matter — say so
     warnings.warn(
         f"huggingface_hub was imported before slm.paths, so it resolved its cache from the "

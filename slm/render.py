@@ -346,7 +346,7 @@ class ChatRenderer:
     def _encode(self, messages: list[dict]) -> tuple[list[int], list[int]]:
         ids: list[int] = []
         tgt: list[int] = []
-        for text, is_target in chat.render_training(messages):
+        for text, is_target in chat.render_training(messages, self.tok.declared_specials):
             e = self.tok.encode(text)
             ids.extend(e)
             tgt.extend([int(is_target)] * len(e))
@@ -386,28 +386,13 @@ class ChatRenderer:
             n_pairs += 1
         return chunks + ([(ids, tgt)] if n_pairs else [])
 
-    @staticmethod
-    def _fold_system(messages: list[dict]) -> list[dict]:
-        """Prepend any system message to the first user turn.
-
-        The template has no system role — one fewer axis for training and inference to drift
-        on. Dropping the text instead would gut ``smoltalk_smollm3_systemchats_30k_no_think``,
-        whose 34k conversations are *about* the system prompt: the assistant's answers
-        reference a persona that would no longer be anywhere in the context.
-        """
-        system = "\n\n".join(m["content"] for m in messages if m.get("role") == "system")
-        turns = [m for m in messages if m.get("role") in ("user", "assistant")]
-        if system and turns and turns[0]["role"] == "user":
-            turns[0] = {"role": "user", "content": f"{system}\n\n{turns[0]['content']}"}
-        return turns
-
     def render(self, batch: dict) -> Rendered:
         ids: list[int] = []
         tgt: list[int] = []
         srt: list[int] = []
         n_ex = n_drop = n_drop_tok = n_bytes = n_trunc = 0
         for messages in batch[self.col]:
-            messages = self._fold_system(messages)
+            messages = chat.fold_system(messages)
             if len(messages) < 2:
                 continue
             n_bytes += sum(len(m["content"].encode()) for m in messages)

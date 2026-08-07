@@ -7,7 +7,7 @@ past it, but to positions the model never saw during training.
 import torch
 import torch.nn.functional as F
 
-from slm import checkpoint, paths
+from slm import chat, checkpoint, paths
 from slm.config import SEP, ModelConfig
 from slm.model import JLM
 from slm.tokenizer import Tokenizer, load_tokenizer, load_tokenizer_json
@@ -122,3 +122,32 @@ def stream(model, tokenizer, *, prompt: str = EOT,
 def generate(model, tokenizer, **kwargs) -> str:
     """The whole continuation at once. See :func:`stream`."""
     return "".join(stream(model, tokenizer, **kwargs))
+
+
+def fit_history(history: list[dict], *, tokenizer: Tokenizer, block_size: int,
+                reserve: int, system: str | None = None) -> tuple[str, int, list[dict]]:
+    """Render a conversation to a prompt, dropping oldest exchanges until the answer fits.
+
+    Returns ``(prompt, n_prompt_tokens, kept)``. ``kept`` is the surviving history and the
+    caller is expected to adopt it — trimming only a local copy leaves the real history
+    growing without bound and re-encoded in full on every turn.
+
+    Here rather than in the CLI because it is *policy*, not presentation: which turns the
+    model gets to see is the same class of decision as :func:`slm.chat.fold_system`, and for
+    the same reason — a second consumer that trimmed its own way would quietly show the model
+    a context shape SFT never trained on. Not in :mod:`slm.chat`, which imports nothing and
+    so cannot count tokens.
+
+    The fold happens *after* trimming, so the system prompt lands on whichever user turn
+    survives as the first rather than on one already dropped. A single turn too long to fit
+    is returned anyway, over budget: the caller must warn, because :func:`stream` then crops
+    the *head*, silently discarding the role header and the system prompt.
+    """
+    turns = list(history)
+    while True:
+        msgs = ([{"role": "system", "content": system}] if system else []) + turns
+        prompt = chat.render_prompt(chat.fold_system(msgs), tokenizer.declared_specials)
+        n = len(tokenizer.encode(prompt))
+        if n + reserve <= block_size or len(turns) <= 1:
+            return prompt, n, turns
+        turns = turns[2:]               # oldest user+assistant pair
