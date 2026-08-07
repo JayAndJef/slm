@@ -1,8 +1,109 @@
 # Jayden's Small Language Model
 
-Current model is 500m params. Core model and tokenizer rolled by hand, but default tokenizer is huggingface's. Default attention is also flashattention/pytorch fused kernels. Trained on a subset of smolLM-corpus, SFT for prompts on smoltalk2.
+A 502M-parameter language model built from scratch — the transformer, the BPE tokenizer, the
+training loop, the data pipeline. Pretrained on a subset of
+[smolLM-corpus](https://huggingface.co/datasets/HuggingFaceTB/smollm-corpus), then
+instruction-tuned on [smoltalk2](https://huggingface.co/datasets/HuggingFaceTB/smoltalk2).
 
-### Example
+The model code and tokenizer are hand-rolled; the default tokenizer at runtime is
+HuggingFace's rust BPE (there is a from-scratch fallback), and attention uses PyTorch's
+fused kernels.
+
+## Run it
+
+**1. Get the weights.** Download the latest checkpoint (~2 GB) from
+[Releases](../../releases). The tokenizer is embedded in the file, so there is nothing else
+to fetch and the weights cannot be paired with the wrong vocabulary.
+
+**2. Set up.** Needs Python 3.10 and [uv](https://docs.astral.sh/uv/):
+
+```bash
+git clone <this repo> && cd slm
+uv sync
+```
+
+**3. Talk to it.**
+
+```bash
+uv run main.py chat --checkpoint jlm-502m-chat.pt
+```
+
+`/reset` clears the conversation, `/exit` quits. Each turn prints its prompt-token count so
+you can watch the 2048-token context fill; the oldest exchanges are dropped when it does.
+
+A GPU is picked automatically — whichever has the most free memory. `--device cpu` works and
+is slow but usable. About 1 GB of VRAM in bf16, 2 GB in fp32.
+
+### Other things you can do
+
+```bash
+# one-shot answer, no conversation
+uv run main.py generate --checkpoint jlm-502m-chat.pt --prompt "Explain photosynthesis"
+
+# raw completion instead of chat (it continues your text rather than answering)
+uv run main.py generate --checkpoint jlm-502m-chat.pt --prompt "The capital of France" --no-chat
+
+# give it a persona
+uv run main.py chat --checkpoint jlm-502m-chat.pt --system "You are a terse pirate."
+
+# what's actually in the file: architecture, corpus, every training run behind it
+uv run main.py inspect jlm-502m-chat.pt
+```
+
+Sampling defaults to `--temperature 1.0 --top-p 0.95`. Lower values make it loop: measured
+over 2048-token generations, 0.8/0.9 starts repeating itself verbatim by ~300 tokens where
+1.0/0.95 lasts ~760. If you want it more focused, drop the temperature and expect loops.
+
+## What it is
+
+| | |
+|---|---|
+| parameters | 502,191,616 |
+| layers / hidden / heads | 16 / 1536 / 12 (head_dim 128) |
+| context | 2048 tokens |
+| vocabulary | 32,000 (BPE, 32 reserved special slots) |
+| architecture | pre-norm decoder, RMSNorm, SwiGLU, RoPE, QK-norm, no biases, tied embeddings |
+| chat format | ChatML (`<\|im_start\|>role … <\|im_end\|>`), no system role — a system prompt folds into the first user turn |
+| precision | trained bf16-mixed |
+
+Trained on 4× A6000 and 8× H100 for pretraining, 2× RTX PRO 6000 for the fine-tune.
+
+## Results
+
+| stage | corpus | tokens | val loss | val bpb |
+|---|---|---|---|---|
+| pretrain | smollm-corpus | 10.37B | 2.2515 | 0.698 |
+| + SFT | smoltalk2 | 2.46B (2 epochs) | 1.0616 | — |
+
+The two val numbers are **not comparable** — different corpora, and the SFT loss covers
+assistant tokens only.
+
+What the fine-tune bought, measured greedily on 40 held-out prompts:
+
+| | base | after SFT |
+|---|---|---|
+| generations that loop | 87.5% | **2.5%** |
+| generations that stop on their own | 0% | **35%** |
+| ARC-Easy (200 items, chance 25%) | 47.0% | 46.0% |
+
+So instruction tuning fixed the looping and taught it to stop, at essentially no cost in
+knowledge.
+
+## Known limitations
+
+**It hallucinates a lot.** Confidently. At 502M parameters it has read about 13B tokens
+total, which is not enough to be reliable about facts — see the national-park answer below,
+which is fluent and almost entirely wrong.
+
+**It does not track conversation state well.** Multi-turn history is passed correctly, but
+ask it your name after telling it and you may get someone else's.
+
+**65% of answers still run to the token cap** rather than stopping cleanly.
+
+**No KV cache** — generation re-runs the full forward pass per token, so long replies slow
+down as the context grows.
+
+## Example
 
 ```
 you> Hello there!
@@ -38,4 +139,21 @@ As the final layer of the cake was added, Malcolm's hands trembled with anticipa
 [426 prompt tokens]
 ```
 
-It does hallucinate a lot.
+## Training your own
+
+Everything needed to reproduce this is in the repo. The corpora are not — they are built
+locally and are ~56 GB.
+
+```bash
+uv run main.py prepare-data --corpus smollm       # encode the pretraining corpus (hours)
+uv run main.py train --corpus smollm --out-dir checkpoints/run1 \
+  --devices 8 --batch-size 12 --accumulate-grad-batches 2 --target-tokens 10e9 --wandb
+uv run main.py prepare-data --corpus smoltalk2    # the SFT corpus
+uv run main.py sft --init-from checkpoints/run1/step<N>-val<X>.ckpt \
+  --out-dir checkpoints/sft --epochs 2
+uv run main.py export checkpoints/sft/step<N>-val<X>.ckpt --out model.pt
+```
+
+`--help` on any command explains its flags. `CLAUDE.md` documents the architecture decisions,
+the corpus/hash design, and the measurements behind the defaults.
+
