@@ -4,8 +4,6 @@ Current model is 500m params. Core model and tokenizer rolled by hand, but defau
 
 ### Example
 
-When asked to complete `How do computers think?`, the model gives:
-
 ```
 you> Hello there!
 bot> Hello! It's nice to meet you. What brings you here today? Are you looking for advice, help with a specific issue, or just someone to chat with for company?
@@ -39,3 +37,5 @@ With a mix of fear and hope, Malcolm sprang into action. He saw that the woman w
 As the final layer of the cake was added, Malcolm's hands trembled with anticipation, and for the first time in years, he felt a sense of purpose. He knew that this was his moment to create something truly beautiful, something that would capture the hearts of all who loved to eat. And
 [426 prompt tokens]
 ```
+
+It does hallucinate a lot.
